@@ -1,0 +1,26 @@
+[package]
+name = "nix-archive"
+description = "Byte-safe, allocation-conscious Nix archive encoding, decoding, hashing, and restoration."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cachix/nix-archive"
+documentation = "https://docs.rs/nix-archive"
+readme = "README.md"
+keywords = ["nix", "nar", "archive", "serialization"]
+categories = ["encoding", "filesystem"]
+
+[dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1"
+tempfile = "3"
+
+[[bench]]
+name = "nar"
+harness = false
