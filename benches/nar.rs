@@ -1,14 +1,20 @@
 //! Run with `cargo bench -p nix-archive --bench nar`.
 
+#[path = "support/nix_daemon.rs"]
+mod nix_daemon;
+
+use std::env;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nix_archive::nar::{
     decode, decode_events, encode_path_with_case_hack, encode_tree, hash_tree, CaseHack, NamedNode,
     Node,
 };
+use nix_daemon::NixDaemon;
 
 #[derive(Default)]
 struct CountingSink {
@@ -172,5 +178,93 @@ fn bench_filesystem(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_regular, bench_directory, bench_filesystem);
+fn find_nix_store_path() -> Option<PathBuf> {
+    let store_directory = Path::new("/nix/store");
+    for directory in env::split_paths(&env::var_os("PATH")?) {
+        let Ok(executable) = directory.join("nix").canonicalize() else {
+            continue;
+        };
+        let Ok(relative) = executable.strip_prefix(store_directory) else {
+            continue;
+        };
+        let Some(Component::Normal(store_name)) = relative.components().next() else {
+            continue;
+        };
+        return Some(store_directory.join(store_name));
+    }
+    None
+}
+
+fn bench_nix_comparison(c: &mut Criterion) {
+    const DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+
+    let Some(store_path) = find_nix_store_path() else {
+        eprintln!("skipping Nix comparison: could not locate the Nix package store path");
+        return;
+    };
+    let Some(store_path_text) = store_path.to_str() else {
+        eprintln!("skipping Nix comparison: Nix store path is not UTF-8");
+        return;
+    };
+    let mut daemon = match NixDaemon::connect(Path::new(DAEMON_SOCKET)) {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            eprintln!("skipping Nix comparison: could not connect to Nix daemon: {error}");
+            return;
+        }
+    };
+
+    let mut expected = Vec::new();
+    encode_path_with_case_hack(&mut expected, &store_path, CaseHack::Disabled).unwrap();
+    let mut nix_output = vec![0; expected.len()];
+    daemon
+        .nar_from_path(store_path_text, &mut nix_output)
+        .unwrap();
+    assert_eq!(
+        nix_output, expected,
+        "nix-archive output differs from Nix daemon NarFromPath"
+    );
+
+    eprintln!(
+        "benchmarking against Nix {} using {} ({} NAR bytes)",
+        daemon.version(),
+        store_path.display(),
+        expected.len()
+    );
+
+    let mut group = c.benchmark_group("nix_comparison");
+    group.throughput(Throughput::Bytes(expected.len() as u64));
+
+    let mut ours_output = Vec::with_capacity(expected.len());
+    group.bench_function("nix_archive_encode_path", |bencher| {
+        bencher.iter(|| {
+            ours_output.clear();
+            encode_path_with_case_hack(
+                &mut ours_output,
+                black_box(&store_path),
+                CaseHack::Disabled,
+            )
+            .unwrap();
+            black_box(ours_output.len())
+        });
+    });
+
+    group.bench_function("nix_daemon_nar_from_path", |bencher| {
+        bencher.iter(|| {
+            daemon
+                .nar_from_path(black_box(store_path_text), &mut nix_output)
+                .unwrap();
+            black_box(nix_output.len())
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_regular,
+    bench_directory,
+    bench_filesystem,
+    bench_nix_comparison
+);
 criterion_main!(benches);
