@@ -11,6 +11,7 @@ keywords = ["nix", "nar", "archive", "serialization"]
 categories = ["encoding", "filesystem"]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"

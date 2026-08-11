@@ -29,6 +29,18 @@ mode handling use Unix APIs.
 nix-archive = "0.1"
 ```
 
+The package also provides a small command-line tool for packing and unpacking
+NAR files:
+
+```console
+nix-archive pack tree.nar ./tree
+nix-archive unpack tree.nar ./restored-tree
+```
+
+The unpack destination must not exist. Use `-` in place of `tree.nar` to write
+the packed archive to standard output or read the archive from standard input,
+matching the streams used by `nix nar pack` and `nix-store --restore`.
+
 ## Decode without allocating
 
 `decode_events` borrows names, targets, and contents directly from the input.
