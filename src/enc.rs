@@ -164,20 +164,20 @@ pub fn hash_regular(contents: &[u8], executable: bool) -> NarHash {
     .expect("a regular borrowed node is always valid")
 }
 
-struct HashSink {
+pub(crate) struct HashSink {
     hasher: Sha256,
     len: u64,
 }
 
 impl HashSink {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             hasher: Sha256::new(),
             len: 0,
         }
     }
 
-    fn finish(self) -> NarHash {
+    pub(crate) fn finish(self) -> NarHash {
         NarHash {
             size: self.len,
             sha256: self.hasher.finalize().into(),

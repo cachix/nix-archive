@@ -16,6 +16,7 @@ mode handling use Unix APIs.
 - Allocation-free borrowed event decoding on valid input.
 - Allocation-free borrowed-tree encoding and SHA-256 hashing.
 - Streaming filesystem encoding: file payloads are never materialized.
+- Streaming Nix-compatible reference scanning with reusable candidate sets.
 - Descriptor-relative filesystem traversal and restoration resist symlink swaps.
 - Post-order collecting decoder for content-addressed tree ingestion.
 - Nix-compatible macOS case-collision restoration and re-encoding.
@@ -119,6 +120,36 @@ Filesystem encoding allocates directory-name metadata so entries can be
 sorted canonically, but regular-file payloads are copied directly from disk to
 the writer. `hash_path` therefore never constructs the complete archive.
 
+## Scan for store-path references
+
+Nix discovers output references by searching the complete NAR byte stream for
+the 32-byte Nix-base32 hash parts of candidate store paths. A
+`ReferencePattern` validates and prepares those candidates once and can then be
+reused for every output of a build:
+
+```rust,no_run
+use std::path::Path;
+use nix_archive::nar::ReferencePattern;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = [
+        "dc04vv14dak1c1r48qa0m23vr9jy8sm0",
+        "zc842j0rz61mjsp3h3wp5ly71ak6qgdn",
+    ];
+    let pattern = ReferencePattern::new(candidates)?;
+    let scan = pattern.scan_path(Path::new("./result"))?;
+
+    // Indices refer to `candidates`; hash and size came from the same NAR pass.
+    println!("{:?} {}", scan.matches, scan.nar_size);
+    Ok(())
+}
+```
+
+For composition with another hash or destination, `pattern.writer(inner)`
+returns a `Write` decorator. It scans only bytes successfully accepted by the
+inner writer, retains a fixed 31-byte boundary tail, and allocates nothing
+while processing chunks.
+
 ## Restore and the macOS case hack
 
 ```rust
@@ -163,6 +194,8 @@ tests, and cross-platform processing.
 | `encode_tree` | Zero allocations with an allocation-free writer |
 | `hash_tree` | Zero allocations |
 | `encode_path` / `hash_path` | Allocates directory metadata; streams file payloads |
+| `ReferencePattern` | Allocates candidate lookup state once; clones share it |
+| `ReferenceScanner` / `ReferenceWriter` | Allocates match state at construction; no allocations while scanning |
 | `restore_path` / `restore_reader` | Payload-independent; allocates depth-bounded name buffers and case-collision state |
 
 These guarantees have allocator-counting integration tests rather than being
@@ -186,8 +219,12 @@ The test suite includes:
 - executable-bit, sorting, duplicate-name, nesting-depth, and many-file cases;
 - restore rejection for invalid or pre-existing destinations of every node type;
 - descriptor-anchoring regressions for concurrent path and symlink swaps;
+- Nix/Lix reference-scanner chunk cases, every split boundary, overlaps, and duplicates;
+- whole-NAR reference matches in file contents, entry names, and symlink targets;
+- an Antithesis SDK workload comparing randomized payloads, candidate sets, and chunking against an independent naive oracle;
+- empty patterns, invalid alphabets, writer failures, case-hack modes, and 32 MiB bounded-memory scanning;
 - macOS case-hack round trips and both collision failure modes;
-- exact zero-allocation assertions for borrowed decoding, encoding, and hashing.
+- exact zero-allocation assertions for borrowed decoding, encoding, hashing, and scanning.
 
 Run tests with:
 
@@ -195,11 +232,20 @@ Run tests with:
 devenv shell -- cargo test
 ```
 
+The Antithesis workload is also directly runnable as a normal integration
+test; its Antithesis assertions are mirrored by native assertions for local
+and CI failures:
+
+```console
+devenv shell -- cargo test --test antithesis_reference_scan -- --nocapture
+```
+
 ## Benchmarks
 
 Criterion benchmarks cover borrowed and collecting decode, borrowed-tree
-encoding and hashing, 1,000-entry directories, filesystem streaming, case
-hack overhead, and filesystem encoding compared with Nix's daemon protocol.
+encoding and hashing, reference scanning with reusable candidate sets,
+1,000-entry directories, filesystem streaming, case hack overhead, and
+filesystem encoding compared with Nix's daemon protocol.
 
 Results from 2026-08-09 on an AMD Ryzen 7 7840S (Linux x86-64), using
 `rustc 1.97.1` and Criterion 0.8.2:

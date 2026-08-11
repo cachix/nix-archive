@@ -4,11 +4,11 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use nix_archive::nar::{encode_path, restore_reader};
+use nix_archive::nar::{encode_path, restore_reader, ReferencePattern};
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -78,16 +78,20 @@ impl Write for CountingSink {
 }
 
 #[test]
-fn large_file_encoding_has_payload_independent_memory_use() {
+fn large_file_encoding_and_reference_scanning_have_payload_independent_memory_use() {
     let _guard = TEST_LOCK.lock().unwrap();
     const FILE_SIZE: u64 = 32 * 1024 * 1024;
     const MAX_EXTRA_LIVE_BYTES: usize = 2 * 1024 * 1024;
+    const HASH: &str = "dc04vv14dak1c1r48qa0m23vr9jy8sm0";
 
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("large-sparse-file");
-    let file = fs::File::create(&path).unwrap();
+    let mut file = fs::File::create(&path).unwrap();
     file.set_len(FILE_SIZE).unwrap();
+    file.seek(SeekFrom::End(-(HASH.len() as i64))).unwrap();
+    file.write_all(HASH.as_bytes()).unwrap();
     drop(file);
+    let pattern = ReferencePattern::new([HASH]).unwrap();
 
     let baseline = LIVE_BYTES.load(Ordering::Relaxed);
     PEAK_BYTES.store(baseline, Ordering::Relaxed);
@@ -105,6 +109,19 @@ fn large_file_encoding_has_payload_independent_memory_use() {
     assert!(
         peak_growth < MAX_EXTRA_LIVE_BYTES,
         "encoding a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
+    );
+
+    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
+    PEAK_BYTES.store(baseline, Ordering::Relaxed);
+
+    let scan = pattern.scan_path(&path).unwrap();
+
+    let peak_growth = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+    assert_eq!(scan.nar_size, sink.bytes);
+    assert_eq!(scan.matches, [0]);
+    assert!(
+        peak_growth < MAX_EXTRA_LIVE_BYTES,
+        "scanning a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
     );
 }
 

@@ -6,7 +6,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nix_archive::nar::{decode_events, encode_tree, hash_tree, Event, NamedNode, Node};
+use nix_archive::nar::{
+    decode_events, encode_tree, hash_tree, Event, NamedNode, Node, ReferencePattern,
+};
 
 static ALLOCATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -141,4 +143,22 @@ fn borrowed_tree_encoding_hashing_and_event_decoding_allocate_nothing() {
     assert_eq!(decoding_allocations, 0, "event decoding allocated");
     assert_eq!(event_count, 7);
     assert_eq!(content_bytes, 22);
+
+    const HASH: &str = "dc04vv14dak1c1r48qa0m23vr9jy8sm0";
+    let pattern = ReferencePattern::new([HASH]).unwrap();
+    let mut scanner = pattern.scanner();
+    let bytes = concat!(
+        "prefix-/nix/store/",
+        "dc04vv14dak1c1r48qa0m23vr9jy8sm0",
+        "-package-suffix"
+    );
+
+    reset_allocations();
+    for chunk in bytes.as_bytes().chunks(3) {
+        scanner.scan(chunk);
+    }
+    let scanning_allocations = allocation_calls();
+
+    assert_eq!(scanning_allocations, 0, "reference scanning allocated");
+    assert_eq!(scanner.matches().next(), Some(0));
 }

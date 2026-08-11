@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nix_archive::nar::{
     decode, decode_events, encode_path_with_case_hack, encode_tree, hash_tree, CaseHack, NamedNode,
-    Node,
+    Node, ReferencePattern,
 };
 use nix_daemon::NixDaemon;
 
@@ -178,6 +178,53 @@ fn bench_filesystem(c: &mut Criterion) {
     group.finish();
 }
 
+fn reference_hash(mut value: usize) -> [u8; 32] {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    let mut hash = [b'0'; 32];
+    for digit in hash.iter_mut().rev() {
+        *digit = ALPHABET[value & 31];
+        value >>= 5;
+    }
+    hash
+}
+
+fn bench_reference_scan(c: &mut Criterion) {
+    const CONTENT_SIZE: usize = 8 * 1024 * 1024;
+    const MAX_CANDIDATES: usize = 4_096;
+
+    // Deterministic binary-like payload with sparse real candidates, matching
+    // the shape of Nix's own reference-scanner benchmark.
+    let mut state = 0x1234_5678_u32;
+    let mut contents = vec![0; CONTENT_SIZE];
+    for byte in &mut contents {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (state >> 24) as u8;
+    }
+    let candidates: Vec<_> = (0..MAX_CANDIDATES).map(reference_hash).collect();
+    let stride = CONTENT_SIZE / MAX_CANDIDATES;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let offset = index * stride;
+        contents[offset..offset + candidate.len()].copy_from_slice(candidate);
+    }
+    let tree = Node::Regular {
+        executable: false,
+        contents: &contents,
+    };
+
+    let mut group = c.benchmark_group("reference_scan_8_mib");
+    group.throughput(Throughput::Bytes(CONTENT_SIZE as u64));
+    group.bench_function("hash_only", |bencher| {
+        bencher.iter(|| black_box(hash_tree(black_box(&tree)).unwrap()));
+    });
+    for count in [16, 256, MAX_CANDIDATES] {
+        let pattern = ReferencePattern::new(&candidates[..count]).unwrap();
+        group.bench_function(BenchmarkId::new("hash_and_scan", count), |bencher| {
+            bencher.iter(|| black_box(pattern.scan_tree(black_box(&tree)).unwrap()));
+        });
+    }
+    group.finish();
+}
+
 fn find_nix_store_path() -> Option<PathBuf> {
     let store_directory = Path::new("/nix/store");
     for directory in env::split_paths(&env::var_os("PATH")?) {
@@ -265,6 +312,7 @@ criterion_group!(
     bench_regular,
     bench_directory,
     bench_filesystem,
+    bench_reference_scan,
     bench_nix_comparison
 );
 criterion_main!(benches);

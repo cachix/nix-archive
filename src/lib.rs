@@ -2,6 +2,7 @@
 
 mod dec;
 mod enc;
+mod refscan;
 mod restore;
 mod wire;
 
@@ -33,6 +34,10 @@ pub mod nar {
         encode_path, encode_path_with_case_hack, encode_regular, encode_tree, hash_path,
         hash_path_with_case_hack, hash_regular, hash_tree, CaseHack, NamedNode, NarHash, Node,
         CASE_HACK_SUFFIX,
+    };
+    pub use crate::refscan::{
+        ReferencePattern, ReferencePatternError, ReferenceScan, ReferenceScanner, ReferenceWriter,
+        REFERENCE_LENGTH,
     };
     pub use crate::restore::{
         restore_path, restore_path_with_case_hack, restore_reader, restore_reader_with_case_hack,
