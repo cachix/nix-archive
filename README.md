@@ -30,8 +30,14 @@ mode handling use Unix APIs.
 nix-archive = "0.2"
 ```
 
-The package also provides a small command-line tool for packing and unpacking
-NAR files:
+The optional `cli` feature provides a small command-line tool for packing and
+unpacking NAR files. Install it with:
+
+```console
+cargo install nix-archive --features cli
+```
+
+Then run:
 
 ```console
 nix-archive pack tree.nar ./tree

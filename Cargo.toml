@@ -10,8 +10,12 @@ readme = "README.md"
 keywords = ["nix", "nar", "archive", "serialization"]
 categories = ["encoding", "filesystem"]
 
+[features]
+default = []
+cli = ["dep:clap"]
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
@@ -23,6 +27,15 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
+
+[[bin]]
+name = "nix-archive"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
 
 [[bench]]
 name = "nar"
