@@ -10,7 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use nix_archive::nar::{
-    decode, encode_path, encode_tree, hash_tree, restore_path, Entry, Error, NamedNode, Node,
+    decode, encode_path, encode_tree, hash_tree, restore_path, restore_reader, Entry, Error,
+    NamedNode, Node,
 };
 
 fn tok(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -139,7 +140,7 @@ fn alignment_boundary_matrix_round_trips() {
         assert!(matches!(
             decode(&nar).unwrap().as_slice(),
             [Entry::Symlink { path, target }]
-                if path.as_os_str().is_empty() && target == contents
+                if path.as_os_str().is_empty() && *target == contents
         ));
 
         let leaf = [NamedNode {
@@ -156,7 +157,7 @@ fn alignment_boundary_matrix_round_trips() {
         assert!(decode(&nar).unwrap().iter().any(|entry| matches!(
             entry,
             Entry::Symlink { path, target }
-                if path == Path::new("d/a") && target == contents
+                if path == Path::new("d/a") && *target == contents
         )));
     }
 }
@@ -193,10 +194,10 @@ fn complex_tree_golden_decodes_restores_and_reencodes() {
     ];
     let tree = Node::Directory(&children);
 
-    let (size, sha256) = hash_tree(&tree).unwrap();
-    assert_eq!(size, 840);
+    let nar_hash = hash_tree(&tree).unwrap();
+    assert_eq!(nar_hash.size, 840);
     assert_eq!(
-        sha256,
+        nar_hash.sha256,
         [
             0xeb, 0xd5, 0x22, 0x79, 0xa8, 0xdf, 0x02, 0x4c, 0x9f, 0xd5, 0x71, 0x8d, 0xe4, 0x10,
             0x3b, 0xf5, 0xe7, 0x60, 0xdc, 0x7f, 0x2c, 0xf4, 0x90, 0x44, 0xee, 0x7d, 0xea, 0x87,
@@ -240,6 +241,82 @@ fn complex_tree_golden_decodes_restores_and_reencodes() {
     let mut reencoded = Vec::new();
     encode_path(&mut reencoded, &restored).unwrap();
     assert_eq!(reencoded, nar);
+}
+
+#[test]
+fn collected_symlink_target_borrows_the_archive() {
+    let mut nar = Vec::new();
+    encode_tree(
+        &mut nar,
+        &Node::Symlink {
+            target: b"borrowed-target",
+        },
+    )
+    .unwrap();
+
+    let entries = decode(&nar).unwrap();
+    let Entry::Symlink { target, .. } = &entries[0] else {
+        panic!("expected a symlink")
+    };
+    let archive = nar.as_ptr_range();
+    assert!(archive.contains(&target.as_ptr()));
+}
+
+struct ChunkedReader<'a> {
+    remaining: &'a [u8],
+}
+
+impl io::Read for ChunkedReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let len = output.len().min(self.remaining.len()).min(3);
+        output[..len].copy_from_slice(&self.remaining[..len]);
+        self.remaining = &self.remaining[len..];
+        Ok(len)
+    }
+}
+
+#[test]
+fn streaming_restore_handles_fragmented_input() {
+    let children = [
+        NamedNode {
+            name: b"file",
+            node: Node::Regular {
+                executable: true,
+                contents: b"payload across tiny reads",
+            },
+        },
+        NamedNode {
+            name: b"link",
+            node: Node::Symlink { target: b"file" },
+        },
+    ];
+    let mut nar = Vec::new();
+    encode_tree(&mut nar, &Node::Directory(&children)).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let restored = tmp.path().join("restored");
+    let mut reader = ChunkedReader { remaining: &nar };
+    restore_reader(&mut reader, &restored).unwrap();
+
+    let mut reencoded = Vec::new();
+    encode_path(&mut reencoded, &restored).unwrap();
+    assert_eq!(reencoded, nar);
+}
+
+#[test]
+fn streaming_restore_bounds_metadata_tokens() {
+    let mut nar = token_nar(&[b"(", b"type", b"symlink", b"target"]);
+    nar.extend_from_slice(&((1024 * 1024 + 1) as u64).to_le_bytes());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut reader = nar.as_slice();
+    assert!(matches!(
+        restore_reader(&mut reader, &tmp.path().join("restored")),
+        Err(Error::TokenTooLarge {
+            size: 1_048_577,
+            limit: 1_048_576
+        })
+    ));
 }
 
 fn root_archives() -> Vec<(&'static str, Vec<u8>)> {

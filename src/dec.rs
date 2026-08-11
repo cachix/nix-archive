@@ -3,14 +3,10 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::nar::Error;
-use crate::wire::{describe_bytes, Cursor};
-
-/// Nix's parser rejects a node at depth 64. Keeping the same limit also bounds
-/// the recursive parser's stack usage for hostile archives.
-const MAX_DEPTH: usize = 64;
+use crate::wire::{describe_bytes, Cursor, MAGIC, MAX_DEPTH};
 
 /// A root-first decoding event. All byte slices borrow directly from the NAR.
 ///
@@ -46,7 +42,7 @@ pub fn decode_events<'a>(
     mut visitor: impl FnMut(Event<'a>) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut cursor = Cursor::new(nar);
-    if cursor.read_token().map_err(|_| Error::BadMagic)? != b"nix-archive-1" {
+    if cursor.read_token().map_err(|_| Error::BadMagic)? != MAGIC {
         return Err(Error::BadMagic);
     }
 
@@ -60,7 +56,7 @@ pub fn decode_events<'a>(
 
 /// One filesystem object from an archive. Paths are relative to the archive
 /// root; the root itself has an empty path.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry<'a> {
     Regular {
         path: PathBuf,
@@ -70,15 +66,17 @@ pub enum Entry<'a> {
     },
     Symlink {
         path: PathBuf,
-        /// Raw target bytes. NAR imposes no UTF-8 constraint.
-        target: Vec<u8>,
+        /// Raw target bytes borrowed from the archive.
+        /// NAR imposes no UTF-8 constraint.
+        target: &'a [u8],
     },
     /// A directory. Emitted **after** all of its children.
     Directory { path: PathBuf },
 }
 
 impl Entry<'_> {
-    pub fn path(&self) -> &PathBuf {
+    /// The entry's path relative to the archive root.
+    pub fn path(&self) -> &Path {
         match self {
             Entry::Regular { path, .. }
             | Entry::Symlink { path, .. }
@@ -90,8 +88,9 @@ impl Entry<'_> {
 /// Decode a NAR into allocated entries in **post-order**: every directory
 /// follows its children, and the root comes last with an empty path.
 ///
-/// This convenience API allocates the returned vector, paths, and symlink
-/// targets. Use [`decode_events`] when decoding must not allocate.
+/// This convenience API allocates the returned vector and paths. File contents
+/// and symlink targets continue to borrow from `nar`. Use [`decode_events`]
+/// when decoding must not allocate.
 pub fn decode(nar: &[u8]) -> Result<Vec<Entry<'_>>, Error> {
     let mut entries = Vec::new();
     let mut directory = PathBuf::new();
@@ -122,7 +121,7 @@ pub fn decode(nar: &[u8]) -> Result<Vec<Entry<'_>>, Error> {
             }),
             Event::Symlink { name, target } => entries.push(Entry::Symlink {
                 path: path_for_name(&directory, name),
-                target: target.to_vec(),
+                target,
             }),
         }
         Ok(())

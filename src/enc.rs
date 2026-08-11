@@ -9,16 +9,14 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 
 use crate::dec::validate_name;
 use crate::nar::Error;
-use crate::wire::{describe_bytes, pad_len, write_token};
-
-const MAX_DEPTH: usize = 64;
+use crate::wire::{describe_bytes, pad_len, write_token, MAGIC, MAX_DEPTH};
 
 /// Suffix used by Nix to preserve case-colliding NAR names on macOS.
 pub const CASE_HACK_SUFFIX: &[u8] = b"~nix~case~hack~";
@@ -72,17 +70,34 @@ pub struct NamedNode<'a> {
     pub node: Node<'a>,
 }
 
+/// The byte length and SHA-256 digest of an encoded NAR.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NarHash {
+    /// Encoded NAR size in bytes.
+    pub size: u64,
+    /// SHA-256 of the complete encoded NAR.
+    pub sha256: [u8; 32],
+}
+
+impl NarHash {
+    /// Split the result into `(size, sha256)`.
+    pub const fn into_parts(self) -> (u64, [u8; 32]) {
+        (self.size, self.sha256)
+    }
+}
+
 /// Serialize an already-sorted borrowed tree without allocating.
 ///
 /// Allocation freedom assumes that `w` itself does not allocate. Names are
 /// validated and directory order is checked while the tree is written.
-pub fn encode_tree(w: &mut impl Write, tree: &Node<'_>) -> Result<(), Error> {
-    write_token(w, b"nix-archive-1")?;
+pub fn encode_tree(w: &mut (impl Write + ?Sized), tree: &Node<'_>) -> Result<(), Error> {
+    write_token(w, MAGIC)?;
     encode_tree_node(w, tree, 0)
 }
 
-/// NAR size and sha256 for [`encode_tree`], without allocation.
-pub fn hash_tree(tree: &Node<'_>) -> Result<(u64, [u8; 32]), Error> {
+/// NAR size and SHA-256 for [`encode_tree`], without allocation.
+pub fn hash_tree(tree: &Node<'_>) -> Result<NarHash, Error> {
     let mut sink = HashSink::new();
     encode_tree(&mut sink, tree)?;
     Ok(sink.finish())
@@ -95,41 +110,42 @@ pub fn hash_tree(tree: &Node<'_>) -> Result<(u64, [u8; 32]), Error> {
 /// default only on macOS. File payloads are streamed rather than buffered.
 /// Once the root is opened, traversal is descriptor-relative and does not
 /// follow symlinks swapped into the tree concurrently.
-pub fn encode_path(w: &mut impl Write, path: &Path) -> Result<(), Error> {
+pub fn encode_path(w: &mut (impl Write + ?Sized), path: &Path) -> Result<(), Error> {
     encode_path_with_case_hack(w, path, CaseHack::native())
 }
 
 /// [`encode_path`] with an explicit Nix case-hack setting.
 pub fn encode_path_with_case_hack(
-    w: &mut impl Write,
+    w: &mut (impl Write + ?Sized),
     path: &Path,
     case_hack: CaseHack,
 ) -> Result<(), Error> {
-    write_token(w, b"nix-archive-1")?;
+    write_token(w, MAGIC)?;
     encode_fs_root(w, path, case_hack)
 }
 
-/// NAR size and sha256 of the tree at `path`, without keeping the bytes.
+/// NAR size and SHA-256 of the tree at `path`, without keeping the bytes.
 ///
-/// This pair is what a `PathInfo` carries as `nar_size` / `nar_sha256`, and
+/// These values are what a `PathInfo` carries as `nar_size` / `nar_sha256`, and
 /// what a fixed output derivation with `outputHashMode = "recursive"` is
 /// verified against.
-pub fn hash_path(path: &Path) -> Result<(u64, [u8; 32]), Error> {
+pub fn hash_path(path: &Path) -> Result<NarHash, Error> {
     hash_path_with_case_hack(path, CaseHack::native())
 }
 
 /// [`hash_path`] with an explicit Nix case-hack setting.
-pub fn hash_path_with_case_hack(
-    path: &Path,
-    case_hack: CaseHack,
-) -> Result<(u64, [u8; 32]), Error> {
+pub fn hash_path_with_case_hack(path: &Path, case_hack: CaseHack) -> Result<NarHash, Error> {
     let mut sink = HashSink::new();
     encode_path_with_case_hack(&mut sink, path, case_hack)?;
     Ok(sink.finish())
 }
 
 /// Serialize a single regular file from in-memory bytes as a complete NAR.
-pub fn encode_regular(w: &mut impl Write, contents: &[u8], executable: bool) -> Result<(), Error> {
+pub fn encode_regular(
+    w: &mut (impl Write + ?Sized),
+    contents: &[u8],
+    executable: bool,
+) -> Result<(), Error> {
     encode_tree(
         w,
         &Node::Regular {
@@ -139,8 +155,8 @@ pub fn encode_regular(w: &mut impl Write, contents: &[u8], executable: bool) -> 
     )
 }
 
-/// [`hash_path`] for [`encode_regular`].
-pub fn hash_regular(contents: &[u8], executable: bool) -> (u64, [u8; 32]) {
+/// NAR size and SHA-256 for [`encode_regular`].
+pub fn hash_regular(contents: &[u8], executable: bool) -> NarHash {
     hash_tree(&Node::Regular {
         executable,
         contents,
@@ -161,8 +177,11 @@ impl HashSink {
         }
     }
 
-    fn finish(self) -> (u64, [u8; 32]) {
-        (self.len, self.hasher.finalize().into())
+    fn finish(self) -> NarHash {
+        NarHash {
+            size: self.len,
+            sha256: self.hasher.finalize().into(),
+        }
     }
 }
 
@@ -178,7 +197,11 @@ impl Write for HashSink {
     }
 }
 
-fn encode_tree_node(w: &mut impl Write, node: &Node<'_>, depth: usize) -> Result<(), Error> {
+fn encode_tree_node(
+    w: &mut (impl Write + ?Sized),
+    node: &Node<'_>,
+    depth: usize,
+) -> Result<(), Error> {
     if depth >= MAX_DEPTH {
         return Err(Error::MaxDepth(MAX_DEPTH));
     }
@@ -245,7 +268,11 @@ impl DirectoryName {
     }
 }
 
-fn encode_fs_root(w: &mut impl Write, path: &Path, case_hack: CaseHack) -> Result<(), Error> {
+fn encode_fs_root(
+    w: &mut (impl Write + ?Sized),
+    path: &Path,
+    case_hack: CaseHack,
+) -> Result<(), Error> {
     let metadata = fs::symlink_metadata(path)?;
 
     if metadata.file_type().is_symlink() {
@@ -257,14 +284,15 @@ fn encode_fs_root(w: &mut impl Write, path: &Path, case_hack: CaseHack) -> Resul
     }
 
     let file = open_path_node(path, metadata.is_dir())?;
-    encode_opened_node(w, file, path, case_hack, 0)
+    let mut diagnostic_path = path.to_owned();
+    encode_opened_node(w, file, &mut diagnostic_path, case_hack, 0)
 }
 
 fn encode_fs_child(
-    w: &mut impl Write,
+    w: &mut (impl Write + ?Sized),
     parent: &fs::File,
     name: &OsStr,
-    path: &Path,
+    path: &mut PathBuf,
     case_hack: CaseHack,
     depth: usize,
 ) -> Result<(), Error> {
@@ -288,14 +316,14 @@ fn encode_fs_child(
             let file = open_child_node(parent, name, true)?;
             encode_opened_node(w, file, path, case_hack, depth)
         }
-        _ => Err(Error::UnsupportedFileType(path.to_owned())),
+        _ => Err(Error::UnsupportedFileType(path.clone())),
     }
 }
 
 fn encode_opened_node(
-    w: &mut impl Write,
+    w: &mut (impl Write + ?Sized),
     mut file: fs::File,
-    path: &Path,
+    path: &mut PathBuf,
     case_hack: CaseHack,
     depth: usize,
 ) -> Result<(), Error> {
@@ -322,17 +350,17 @@ fn encode_opened_node(
         w.write_all(&len.to_le_bytes())?;
         let copied = io::copy(&mut file, w)?;
         if copied != len {
-            return Err(Error::FileChanged(path.to_owned()));
+            return Err(Error::FileChanged(path.clone()));
         }
         // A regular read cannot sit at EOF early, but it can grow past it.
         if file.take(1).read(&mut [0u8; 1])? != 0 {
-            return Err(Error::FileChanged(path.to_owned()));
+            return Err(Error::FileChanged(path.clone()));
         }
         w.write_all(&[0u8; 8][..pad_len(len as usize)])?;
     } else if metadata.is_dir() {
         write_token(w, b"directory")?;
         let mut names = read_directory_names(&file, case_hack)?;
-        names.sort_by(|a, b| a.archive_bytes().cmp(b.archive_bytes()));
+        names.sort_unstable_by(|a, b| a.archive_bytes().cmp(b.archive_bytes()));
 
         for pair in names.windows(2) {
             if pair[0].archive_bytes() == pair[1].archive_bytes() {
@@ -349,25 +377,25 @@ fn encode_opened_node(
             write_token(w, b"name")?;
             write_token(w, name.archive_bytes())?;
             write_token(w, b"node")?;
-            encode_fs_child(
-                w,
-                &file,
-                &name.disk,
-                &path.join(&name.disk),
-                case_hack,
-                depth + 1,
-            )?;
+            path.push(&name.disk);
+            let result = encode_fs_child(w, &file, &name.disk, path, case_hack, depth + 1);
+            path.pop();
+            result?;
             write_token(w, b")")?;
         }
     } else {
-        return Err(Error::UnsupportedFileType(path.to_owned()));
+        return Err(Error::UnsupportedFileType(path.clone()));
     }
 
     write_token(w, b")")?;
     Ok(())
 }
 
-fn encode_symlink_node(w: &mut impl Write, target: &[u8], depth: usize) -> Result<(), Error> {
+fn encode_symlink_node(
+    w: &mut (impl Write + ?Sized),
+    target: &[u8],
+    depth: usize,
+) -> Result<(), Error> {
     if depth >= MAX_DEPTH {
         return Err(Error::MaxDepth(MAX_DEPTH));
     }
@@ -456,7 +484,10 @@ mod tests {
             let mut from_bytes = Vec::new();
             encode_regular(&mut from_bytes, contents, executable).unwrap();
             assert_eq!(from_bytes, from_fs);
-            assert_eq!(hash_regular(contents, executable).0, from_fs.len() as u64);
+            assert_eq!(
+                hash_regular(contents, executable).size,
+                from_fs.len() as u64
+            );
         }
     }
 
@@ -464,7 +495,7 @@ mod tests {
     fn opened_nodes_cannot_be_redirected_by_path_swaps() {
         let tmp = tempfile::tempdir().unwrap();
 
-        let regular = tmp.path().join("regular");
+        let mut regular = tmp.path().join("regular");
         let moved_regular = tmp.path().join("moved-regular");
         let secret = tmp.path().join("secret");
         fs::write(&regular, b"expected").unwrap();
@@ -474,11 +505,11 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &regular).unwrap();
 
         let mut regular_nar = Vec::new();
-        write_token(&mut regular_nar, b"nix-archive-1").unwrap();
+        write_token(&mut regular_nar, MAGIC).unwrap();
         encode_opened_node(
             &mut regular_nar,
             opened_regular,
-            &regular,
+            &mut regular,
             CaseHack::Disabled,
             0,
         )
@@ -488,7 +519,7 @@ mod tests {
             [Entry::Regular { contents, .. }] if *contents == b"expected"
         ));
 
-        let directory = tmp.path().join("directory");
+        let mut directory = tmp.path().join("directory");
         let moved_directory = tmp.path().join("moved-directory");
         let outside = tmp.path().join("outside");
         fs::create_dir(&directory).unwrap();
@@ -500,11 +531,11 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &directory).unwrap();
 
         let mut directory_nar = Vec::new();
-        write_token(&mut directory_nar, b"nix-archive-1").unwrap();
+        write_token(&mut directory_nar, MAGIC).unwrap();
         encode_opened_node(
             &mut directory_nar,
             opened_directory,
-            &directory,
+            &mut directory,
             CaseHack::Disabled,
             0,
         )

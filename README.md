@@ -62,7 +62,8 @@ fn payload_bytes(nar: &[u8]) -> Result<usize, Error> {
 ```
 
 For callers that want owned relative paths and post-order traversal, `decode`
-returns a `Vec<Entry>` with every directory after its children.
+returns a `Vec<Entry>` with every directory after its children. File contents
+and symlink targets remain borrowed from the input archive.
 
 ## Encode a borrowed tree without allocating
 
@@ -108,8 +109,8 @@ fn main() -> Result<(), Error> {
     let mut nar = Vec::new();
     encode_path(&mut nar, path)?;
 
-    let (nar_size, _nar_sha256) = hash_path(path)?;
-    assert_eq!(nar_size, nar.len() as u64);
+    let nar_hash = hash_path(path)?;
+    assert_eq!(nar_hash.size, nar.len() as u64);
     Ok(())
 }
 ```
@@ -129,6 +130,19 @@ fn restore(nar: &[u8]) -> Result<(), Error> {
 }
 ```
 
+For archives that are not already in memory, `restore_reader` accepts any
+`std::io::Read` and streams regular-file contents directly to disk:
+
+```rust,no_run
+use std::{fs::File, io::BufReader, path::Path};
+use nix_archive::nar::{restore_reader, Error};
+
+fn restore_file() -> Result<(), Error> {
+    let mut nar = BufReader::new(File::open("tree.nar")?);
+    restore_reader(&mut nar, Path::new("./restored"))
+}
+```
+
 The destination must not exist, and its final lexical component must not be
 empty, `.` or `..`. Restoration is not transactional; an error can leave a
 partial tree. Child creation is descriptor-relative, so replacing a restored
@@ -145,11 +159,11 @@ tests, and cross-platform processing.
 | API | Heap behavior |
 | --- | --- |
 | `decode_events` | Zero allocations on valid input with an allocation-free visitor |
-| `decode` | Allocates the result vector, paths, and symlink targets |
+| `decode` | Allocates the result vector and paths; payloads and symlink targets remain borrowed |
 | `encode_tree` | Zero allocations with an allocation-free writer |
 | `hash_tree` | Zero allocations |
 | `encode_path` / `hash_path` | Allocates directory metadata; streams file payloads |
-| `restore_path` | Allocates path and case-collision state |
+| `restore_path` / `restore_reader` | Payload-independent; allocates depth-bounded name buffers and case-collision state |
 
 These guarantees have allocator-counting integration tests rather than being
 inferred from bounded memory use.
@@ -241,4 +255,4 @@ new modules without changing the `nix-archive` package name.
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)

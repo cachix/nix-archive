@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use nix_archive::nar::{decode, encode_path, Entry};
+use nix_archive::nar::{decode, encode_path, restore_reader, Entry};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -93,6 +93,18 @@ mod hostile_bytes {
         fn arbitrary_input_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = decode(&bytes);
+            }));
+            prop_assert!(outcome.is_ok());
+        }
+
+        #[test]
+        fn arbitrary_streamed_input_never_panics(
+            bytes in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut reader = bytes.as_slice();
+                let _ = restore_reader(&mut reader, &tmp.path().join("restored"));
             }));
             prop_assert!(outcome.is_ok());
         }

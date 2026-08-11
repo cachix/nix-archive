@@ -4,13 +4,15 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use nix_archive::nar::encode_path;
+use nix_archive::nar::{encode_path, restore_reader};
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct TrackingAllocator;
 
@@ -77,6 +79,7 @@ impl Write for CountingSink {
 
 #[test]
 fn large_file_encoding_has_payload_independent_memory_use() {
+    let _guard = TEST_LOCK.lock().unwrap();
     const FILE_SIZE: u64 = 32 * 1024 * 1024;
     const MAX_EXTRA_LIVE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -102,5 +105,37 @@ fn large_file_encoding_has_payload_independent_memory_use() {
     assert!(
         peak_growth < MAX_EXTRA_LIVE_BYTES,
         "encoding a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
+    );
+}
+
+#[test]
+fn large_file_streaming_restore_has_payload_independent_memory_use() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    const FILE_SIZE: u64 = 32 * 1024 * 1024;
+    const MAX_EXTRA_LIVE_BYTES: usize = 2 * 1024 * 1024;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("large-sparse-file");
+    fs::File::create(&source)
+        .unwrap()
+        .set_len(FILE_SIZE)
+        .unwrap();
+    let archive_path = tmp.path().join("large.nar");
+    let mut archive = fs::File::create(&archive_path).unwrap();
+    encode_path(&mut archive, &source).unwrap();
+    drop(archive);
+
+    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
+    PEAK_BYTES.store(baseline, Ordering::Relaxed);
+
+    let mut archive = BufReader::new(fs::File::open(&archive_path).unwrap());
+    let restored = tmp.path().join("restored");
+    restore_reader(&mut archive, &restored).unwrap();
+
+    let peak_growth = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+    assert_eq!(fs::metadata(restored).unwrap().len(), FILE_SIZE);
+    assert!(
+        peak_growth < MAX_EXTRA_LIVE_BYTES,
+        "restoring a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
     );
 }

@@ -7,6 +7,11 @@ use std::io::Write;
 
 use crate::nar::Error;
 
+pub(crate) const MAGIC: &[u8] = b"nix-archive-1";
+/// Nix rejects a node at depth 64. This also bounds recursive stack use for
+/// hostile archives.
+pub(crate) const MAX_DEPTH: usize = 64;
+
 pub(crate) fn pad_len(len: usize) -> usize {
     (8 - len % 8) % 8
 }
@@ -16,7 +21,7 @@ const ZEROS: [u8; 8] = [0; 8];
 /// Keep diagnostics for hostile tokens small even when the token itself is
 /// enormous. Invalid UTF-8 can expand to three bytes per input byte, so bound
 /// the input rather than the resulting `String`.
-const ERROR_PREVIEW_BYTES: usize = 1024;
+pub(crate) const ERROR_PREVIEW_BYTES: usize = 1024;
 
 pub(crate) fn describe_bytes(bytes: &[u8]) -> String {
     let end = bytes.len().min(ERROR_PREVIEW_BYTES);
@@ -28,7 +33,7 @@ pub(crate) fn describe_bytes(bytes: &[u8]) -> String {
 }
 
 /// Write one token.
-pub(crate) fn write_token(w: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_token(w: &mut (impl Write + ?Sized), bytes: &[u8]) -> std::io::Result<()> {
     w.write_all(&(bytes.len() as u64).to_le_bytes())?;
     w.write_all(bytes)?;
     w.write_all(&ZEROS[..pad_len(bytes.len())])

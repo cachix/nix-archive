@@ -262,10 +262,10 @@ fn hash_path_matches_dump() {
     };
 
     let dump = nix_dump(&root);
-    let (nar_size, nar_sha256) = hash_path(&root).expect("hash_path");
-    assert_eq!(nar_size, dump.len() as u64);
+    let nar_hash = hash_path(&root).expect("hash_path");
+    assert_eq!(nar_hash.size, dump.len() as u64);
     let expected: [u8; 32] = Sha256::digest(&dump).into();
-    assert_eq!(nar_sha256, expected);
+    assert_eq!(nar_hash.sha256, expected);
 }
 
 /// Unpack a post-order entry stream to disk (children arrive before their
@@ -322,7 +322,7 @@ fn non_utf8_names_and_targets_survive() {
     assert!(
         entries.iter().any(|e| matches!(
             e,
-            Entry::Symlink { target, .. } if target == WEIRD_TARGET
+            Entry::Symlink { target, .. } if *target == WEIRD_TARGET
         )),
         "non UTF-8 symlink target was not preserved byte exact"
     );

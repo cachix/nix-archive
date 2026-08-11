@@ -21,23 +21,28 @@ mod wire;
 /// - [`encode_path`](crate::nar::encode_path) and
 ///   [`hash_path`](crate::nar::hash_path) allocate directory-name metadata for
 ///   canonical sorting, while file payloads remain streaming.
-/// - [`restore_path`](crate::nar::restore_path) recreates a tree and applies
-///   Nix's macOS case-collision hack by native default.
+/// - [`restore_reader`](crate::nar::restore_reader) recreates a tree from a
+///   stream with payload-independent memory use; [`restore_path`](crate::nar::restore_path)
+///   is the borrowed-slice convenience API. Both apply Nix's macOS
+///   case-collision hack by native default.
 ///
 /// Names, symlink targets, and contents are raw bytes; none require UTF-8.
 pub mod nar {
     pub use crate::dec::{decode, decode_events, Entry, Event};
     pub use crate::enc::{
         encode_path, encode_path_with_case_hack, encode_regular, encode_tree, hash_path,
-        hash_path_with_case_hack, hash_regular, hash_tree, CaseHack, NamedNode, Node,
+        hash_path_with_case_hack, hash_regular, hash_tree, CaseHack, NamedNode, NarHash, Node,
         CASE_HACK_SUFFIX,
     };
-    pub use crate::restore::{restore_path, restore_path_with_case_hack};
+    pub use crate::restore::{
+        restore_path, restore_path_with_case_hack, restore_reader, restore_reader_with_case_hack,
+    };
 
     use thiserror::Error;
 
     /// A malformed NAR or filesystem encoding/restoration failure.
     #[derive(Debug, Error)]
+    #[non_exhaustive]
     pub enum Error {
         #[error("unexpected end of archive")]
         UnexpectedEof,
@@ -67,8 +72,13 @@ pub mod nar {
         },
         #[error("too many case-colliding names in one directory")]
         CaseHackCounterOverflow,
-        #[error("invalid directory event sequence while restoring NAR")]
-        InvalidRestoreState,
+        #[error("NAR metadata token is {size} bytes, exceeding the restoration limit of {limit}")]
+        TokenTooLarge {
+            /// Declared token size.
+            size: u64,
+            /// Maximum size accepted by streaming restoration.
+            limit: usize,
+        },
         #[error("file changed size while encoding: {0}")]
         FileChanged(std::path::PathBuf),
         #[error("unsupported file type: {0}")]

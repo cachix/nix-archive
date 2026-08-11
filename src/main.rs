@@ -1,10 +1,10 @@
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use nix_archive::nar::{encode_path, restore_path};
+use nix_archive::nar::{encode_path, restore_reader};
 
 /// Pack and unpack Nix Archive (NAR) files without linking to Nix.
 #[derive(Parser)]
@@ -85,24 +85,23 @@ fn pack(narfile: &Path, directory: &Path) -> Result<(), String> {
 }
 
 fn unpack(narfile: &Path, directory: &Path) -> Result<(), String> {
-    let nar = if narfile == Path::new("-") {
-        let mut nar = Vec::new();
-        io::stdin()
-            .lock()
-            .read_to_end(&mut nar)
-            .map_err(|error| format!("cannot read standard input: {error}"))?;
-        nar
-    } else {
-        fs::read(narfile).map_err(|error| format!("cannot read {}: {error}", narfile.display()))?
+    let restore = |reader: &mut dyn io::Read| {
+        restore_reader(reader, directory).map_err(|error| {
+            format!(
+                "cannot unpack {} into {}: {error}",
+                archive_name(narfile),
+                directory.display()
+            )
+        })
     };
 
-    restore_path(&nar, directory).map_err(|error| {
-        format!(
-            "cannot unpack {} into {}: {error}",
-            archive_name(narfile),
-            directory.display()
-        )
-    })
+    if narfile == Path::new("-") {
+        restore(&mut io::stdin().lock())
+    } else {
+        let archive = File::open(narfile)
+            .map_err(|error| format!("cannot open {}: {error}", narfile.display()))?;
+        restore(&mut BufReader::new(archive))
+    }
 }
 
 fn archive_name(path: &Path) -> String {

@@ -115,15 +115,16 @@ fn borrowed_tree_encoding_hashing_and_event_decoding_allocate_nothing() {
     let mut sink = FixedSink::new();
 
     reset_allocations();
-    encode_tree(&mut sink, &tree).unwrap();
+    let writer: &mut dyn Write = &mut sink;
+    encode_tree(writer, &tree).unwrap();
     let encoding_allocations = allocation_calls();
     assert_eq!(encoding_allocations, 0, "borrowed-tree encoding allocated");
 
     reset_allocations();
-    let (nar_size, _nar_hash) = hash_tree(&tree).unwrap();
+    let nar_hash = hash_tree(&tree).unwrap();
     let hashing_allocations = allocation_calls();
     assert_eq!(hashing_allocations, 0, "borrowed-tree hashing allocated");
-    assert_eq!(nar_size, sink.written().len() as u64);
+    assert_eq!(nar_hash.size, sink.written().len() as u64);
 
     let mut event_count = 0;
     let mut content_bytes = 0;
