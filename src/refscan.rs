@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::enc::{encode_path_with_case_hack, encode_tree, CaseHack, HashSink, Node};
+use crate::enc::{encode_path, encode_tree, CaseHack, HashSink, Node};
 use crate::nar::Error as NarError;
 
 /// Length of the Nix-base32 hash part at the start of a store-path name.
@@ -140,19 +140,28 @@ impl ReferencePattern {
     }
 
     /// NAR hash, size, and candidate matches for a filesystem tree.
-    pub fn scan_path(&self, path: &Path) -> Result<ReferenceScan, NarError> {
-        self.scan_path_with_case_hack(path, CaseHack::native())
+    ///
+    /// `case_hack` is required rather than defaulted because it changes the
+    /// NAR bytes, and so both the hash and what the scanner sees. Pass
+    /// [`CaseHack::native`] to reproduce Nix's own default.
+    pub fn scan_path(&self, path: &Path, case_hack: CaseHack) -> Result<ReferenceScan, NarError> {
+        let mut writer = self.writer(HashSink::new());
+        encode_path(&mut writer, path, case_hack)?;
+        Ok(finish_nar_scan(writer))
     }
 
-    /// [`ReferencePattern::scan_path`] with an explicit Nix case-hack setting.
+    /// Renamed to [`scan_path`](Self::scan_path), which now takes the setting
+    /// directly.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use `scan_path`, which now takes `case_hack` directly"
+    )]
     pub fn scan_path_with_case_hack(
         &self,
         path: &Path,
         case_hack: CaseHack,
     ) -> Result<ReferenceScan, NarError> {
-        let mut writer = self.writer(HashSink::new());
-        encode_path_with_case_hack(&mut writer, path, case_hack)?;
-        Ok(finish_nar_scan(writer))
+        self.scan_path(path, case_hack)
     }
 }
 

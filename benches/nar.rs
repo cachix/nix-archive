@@ -11,8 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nix_archive::nar::{
-    decode, decode_events, encode_path_with_case_hack, encode_tree, hash_tree, CaseHack, NamedNode,
-    Node, ReferencePattern,
+    decode, decode_events, encode_path, encode_tree, hash_tree, CaseHack, NamedNode, Node,
+    ReferencePattern,
 };
 use nix_daemon::NixDaemon;
 
@@ -157,7 +157,7 @@ fn bench_filesystem(c: &mut Criterion) {
     group.bench_function("regular_8_mib", |bencher| {
         bencher.iter(|| {
             let mut sink = CountingSink::default();
-            encode_path_with_case_hack(&mut sink, black_box(&file), CaseHack::Disabled).unwrap();
+            encode_path(&mut sink, black_box(&file), CaseHack::Disabled).unwrap();
             black_box(sink.bytes)
         });
     });
@@ -170,7 +170,7 @@ fn bench_filesystem(c: &mut Criterion) {
         group.bench_function(label, |bencher| {
             bencher.iter(|| {
                 let mut sink = CountingSink::default();
-                encode_path_with_case_hack(&mut sink, black_box(&directory), case_hack).unwrap();
+                encode_path(&mut sink, black_box(&directory), case_hack).unwrap();
                 black_box(sink.bytes)
             });
         });
@@ -262,7 +262,7 @@ fn bench_nix_comparison(c: &mut Criterion) {
     };
 
     let mut expected = Vec::new();
-    encode_path_with_case_hack(&mut expected, &store_path, CaseHack::Disabled).unwrap();
+    encode_path(&mut expected, &store_path, CaseHack::Disabled).unwrap();
     let mut nix_output = vec![0; expected.len()];
     daemon
         .nar_from_path(store_path_text, &mut nix_output)
@@ -286,12 +286,7 @@ fn bench_nix_comparison(c: &mut Criterion) {
     group.bench_function("nix_archive_encode_path", |bencher| {
         bencher.iter(|| {
             ours_output.clear();
-            encode_path_with_case_hack(
-                &mut ours_output,
-                black_box(&store_path),
-                CaseHack::Disabled,
-            )
-            .unwrap();
+            encode_path(&mut ours_output, black_box(&store_path), CaseHack::Disabled).unwrap();
             black_box(ours_output.len())
         });
     });

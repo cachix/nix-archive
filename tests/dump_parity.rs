@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nix_archive::nar::{decode, encode_path, hash_path, Entry, Error};
+use nix_archive::nar::{decode, encode_path, hash_path, CaseHack, Entry, Error};
 use sha2::{Digest as _, Sha256};
 
 const WEIRD_NAME: &[u8] = b"weird-\xff\xfe-name";
@@ -135,7 +135,7 @@ fn offline_symlink_golden_matches() {
     std::os::unix::fs::symlink("hello.c", &link).unwrap();
 
     let mut encoded = Vec::new();
-    encode_path(&mut encoded, &link).unwrap();
+    encode_path(&mut encoded, &link, CaseHack::native()).unwrap();
     assert_eq!(encoded, golden(SYMLINK_GOLDEN));
     assert!(matches!(
         decode(&encoded).unwrap().as_slice(),
@@ -163,7 +163,7 @@ fn offline_directory_golden_matches() {
     std::os::unix::fs::symlink("hello.c", root.join("hi.c")).unwrap();
 
     let mut encoded = Vec::new();
-    encode_path(&mut encoded, &root).unwrap();
+    encode_path(&mut encoded, &root, CaseHack::native()).unwrap();
     assert_eq!(encoded, golden(DIRECTORY_GOLDEN));
     assert_eq!(decode(&encoded).unwrap().len(), 4);
 }
@@ -175,7 +175,7 @@ fn encoder_matches_nix_store_dump() {
     };
 
     let mut ours = Vec::new();
-    encode_path(&mut ours, &root).expect("encode");
+    encode_path(&mut ours, &root, CaseHack::native()).expect("encode");
     assert_eq!(
         ours,
         nix_dump(&root),
@@ -192,7 +192,7 @@ fn encoder_matches_on_non_directory_roots() {
     for entry in ["hello.txt", "run.sh", "link", "linkdir", "empty"] {
         let path = root.join(entry);
         let mut ours = Vec::new();
-        encode_path(&mut ours, &path).expect("encode");
+        encode_path(&mut ours, &path, CaseHack::native()).expect("encode");
         assert_eq!(ours, nix_dump(&path), "NAR bytes differ for root {entry}");
     }
 }
@@ -206,7 +206,7 @@ fn symlink_to_directory_is_never_followed() {
     std::os::unix::fs::symlink("target", root.join("link-to-directory")).unwrap();
 
     let mut nar = Vec::new();
-    encode_path(&mut nar, &root).unwrap();
+    encode_path(&mut nar, &root, CaseHack::native()).unwrap();
     if have_nix() {
         assert_eq!(nar, nix_dump(&root));
     }
@@ -241,7 +241,7 @@ fn only_owner_execute_bit_marks_a_regular_file_executable() {
         let mode = 0o600 | execute_bits;
         fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
         let mut nar = Vec::new();
-        encode_path(&mut nar, &file).unwrap();
+        encode_path(&mut nar, &file, CaseHack::native()).unwrap();
         if have_nix() {
             assert_eq!(nar, nix_dump(&file), "Nix parity failed for mode {mode:o}");
         }
@@ -262,7 +262,7 @@ fn hash_path_matches_dump() {
     };
 
     let dump = nix_dump(&root);
-    let nar_hash = hash_path(&root).expect("hash_path");
+    let nar_hash = hash_path(&root, CaseHack::native()).expect("hash_path");
     assert_eq!(nar_hash.size, dump.len() as u64);
     let expected: [u8; 32] = Sha256::digest(&dump).into();
     assert_eq!(nar_hash.sha256, expected);
@@ -306,7 +306,7 @@ fn decode_unpack_reencode_round_trips() {
     }
 
     let mut reencoded = Vec::new();
-    encode_path(&mut reencoded, &base).expect("re-encode");
+    encode_path(&mut reencoded, &base, CaseHack::native()).expect("re-encode");
     assert_eq!(reencoded, dump, "unpack + re-encode lost information");
 }
 

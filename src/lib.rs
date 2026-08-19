@@ -16,6 +16,11 @@ mod wire;
 /// - [`decode_events`](crate::nar::decode_events) visits borrowed root-first
 ///   events without allocating on valid input; [`decode`](crate::nar::decode)
 ///   is an allocating post-order convenience API.
+/// - [`decode_events_reader`](crate::nar::decode_events_reader) visits the same
+///   [`Event`](crate::nar::Event)s from a stream, with a file's contents as a
+///   [`FileContents`](crate::nar::FileContents) reader, so memory use follows
+///   directory depth and metadata rather than payload size. `Event` is generic
+///   over its contents type, so one visitor can serve both decoders.
 /// - [`encode_tree`](crate::nar::encode_tree) and
 ///   [`hash_tree`](crate::nar::hash_tree) serialize an already-sorted borrowed
 ///   tree without allocating when the writer does not allocate.
@@ -23,24 +28,31 @@ mod wire;
 ///   [`hash_path`](crate::nar::hash_path) allocate directory-name metadata for
 ///   canonical sorting, while file payloads remain streaming.
 /// - [`restore_reader`](crate::nar::restore_reader) recreates a tree from a
-///   stream with payload-independent memory use; [`restore_path`](crate::nar::restore_path)
-///   is the borrowed-slice convenience API. Both apply Nix's macOS
-///   case-collision hack by native default.
+///   stream with payload-independent memory use; [`restore`](crate::nar::restore)
+///   is the borrowed-slice convenience API. Both require an explicit
+///   [`CaseHack`](crate::nar::CaseHack) for Nix's macOS case-collision hack;
+///   [`CaseHack::native`](crate::nar::CaseHack::native) reproduces Nix's own
+///   default.
 ///
 /// Names, symlink targets, and contents are raw bytes; none require UTF-8.
 pub mod nar {
-    pub use crate::dec::{decode, decode_events, Entry, Event};
-    pub use crate::enc::{
-        encode_path, encode_path_with_case_hack, encode_regular, encode_tree, hash_path,
-        hash_path_with_case_hack, hash_regular, hash_tree, CaseHack, NamedNode, NarHash, Node,
-        CASE_HACK_SUFFIX,
+    pub use crate::dec::{
+        decode, decode_events, decode_events_reader, Entry, Event, FileContents, ReadEvent,
     };
+    pub use crate::enc::{
+        encode_path, encode_regular, encode_tree, hash_path, hash_regular, hash_tree, CaseHack,
+        NamedNode, NarHash, Node, CASE_HACK_SUFFIX,
+    };
+    #[allow(deprecated)]
+    pub use crate::enc::{encode_path_with_case_hack, hash_path_with_case_hack};
     pub use crate::refscan::{
         ReferencePattern, ReferencePatternError, ReferenceScan, ReferenceScanner, ReferenceWriter,
         REFERENCE_LENGTH,
     };
+    pub use crate::restore::{restore, restore_reader};
+    #[allow(deprecated)]
     pub use crate::restore::{
-        restore_path, restore_path_with_case_hack, restore_reader, restore_reader_with_case_hack,
+        restore_path, restore_path_with_case_hack, restore_reader_with_case_hack,
     };
 
     use thiserror::Error;
@@ -77,11 +89,11 @@ pub mod nar {
         },
         #[error("too many case-colliding names in one directory")]
         CaseHackCounterOverflow,
-        #[error("NAR metadata token is {size} bytes, exceeding the restoration limit of {limit}")]
+        #[error("NAR metadata token is {size} bytes, exceeding the streaming limit of {limit}")]
         TokenTooLarge {
             /// Declared token size.
             size: u64,
-            /// Maximum size accepted by streaming restoration.
+            /// Maximum size accepted by the streaming decode and restore APIs.
             limit: usize,
         },
         #[error("file changed size while encoding: {0}")]
