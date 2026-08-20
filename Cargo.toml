@@ -1,7 +1,7 @@
 [package]
 name = "nix-archive"
 description = "Byte-safe, allocation-conscious Nix archive encoding, decoding, hashing, and restoration."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cachix/nix-archive"
