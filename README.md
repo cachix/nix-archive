@@ -14,6 +14,7 @@ mode handling use Unix APIs.
 
 - Byte-exact NAR encoding compatible with `nix-store --dump`.
 - Allocation-free borrowed event decoding on valid input.
+- Payload-independent streaming event decoding from any `std::io::Read`.
 - Allocation-free borrowed-tree encoding and SHA-256 hashing.
 - Streaming filesystem encoding: file payloads are never materialized.
 - Streaming Nix-compatible reference scanning with reusable candidate sets.
@@ -50,8 +51,8 @@ matching the streams used by `nix nar pack` and `nix-store --restore`.
 
 ## Choosing an API
 
-Five ways in, along two axes: whether the archive is already in memory, and
-whether you want a visitor or a data structure.
+Five decoding and restoration APIs span two axes: whether the archive is
+already in memory, and whether you want a visitor or a data structure.
 
 Names follow one rule: the base name is the in-memory form and `_reader` means
 it takes a `std::io::Read` instead of a `&[u8]`. Anything that touches the
@@ -151,7 +152,7 @@ fn payload_bytes() -> Result<u64, Error> {
     let mut total = 0;
     decode_events_reader(&mut nar, |event| {
         if let ReadEvent::Regular { mut contents, .. } = event {
-            total += io::copy(&mut contents, &mut io::sink())?;
+            total += contents.copy_to(&mut io::sink())?;
         }
         Ok(())
     })?;
@@ -344,6 +345,8 @@ The test suite includes:
 - arbitrary-input no-panic and generated-filesystem round-trip properties;
 - exhaustive truncation checks, hostile lengths, bounded diagnostics, and
   nonzero padding at every alignment;
+- streaming-decoder parity for every validation branch, early payload drops,
+  copy failures, and payload-independent allocation counts;
 - non-UTF-8 names and symlink targets;
 - executable-bit, sorting, duplicate-name, nesting-depth, and many-file cases;
 - restore rejection for invalid or pre-existing destinations of every node type;
@@ -371,31 +374,38 @@ devenv shell -- cargo test --test antithesis_reference_scan -- --nocapture
 
 ## Benchmarks
 
-Criterion benchmarks cover borrowed and collecting decode, borrowed-tree
+Criterion benchmarks cover borrowed, collecting, and streaming decode (both
+`FileContents::copy_to` and ordinary `Read` consumption), borrowed-tree
 encoding and hashing, reference scanning with reusable candidate sets,
 1,000-entry directories, filesystem streaming, case hack overhead, and
 filesystem encoding compared with Nix's daemon protocol.
 
-Results from 2026-08-09 on an AMD Ryzen 7 7840S (Linux x86-64), using
-`rustc 1.97.1` and Criterion 0.8.2:
+Results from 2026-08-20 on an AMD Ryzen 7 7840S (Linux x86-64), using
+`rustc 1.97.1` and Criterion 0.8.2. Criterion was pinned to one otherwise idle
+logical CPU to isolate it from unrelated builds running on the host.
 
 | Input | Operation | Time | Throughput |
 | --- | --- | ---: | ---: |
-| 4 KiB regular file | `decode_events` | 52.6 ns | — |
-| 4 KiB regular file | `decode` | 72.3 ns | — |
-| 4 KiB regular file | `encode_tree` to counting sink | 22.5 ns | — |
-| 4 KiB regular file | `hash_tree` | 2.78 µs | 1.41 GiB/s |
-| 1 MiB regular file | `decode_events` | 52.5 ns | — |
-| 1 MiB regular file | `decode` | 75.2 ns | — |
-| 1 MiB regular file | `encode_tree` to counting sink | 22.7 ns | — |
-| 1 MiB regular file | `hash_tree` | 667 µs | 1.46 GiB/s |
-| 1,000-entry borrowed directory | `decode_events` | 94.8 µs | 10.5 M entries/s |
-| 1,000-entry borrowed directory | `decode` | 141 µs | 7.08 M entries/s |
-| 1,000-entry borrowed directory | `encode_tree` to counting sink | 47.4 µs | 21.1 M entries/s |
-| 1,000-entry borrowed directory | `hash_tree` | 263 µs | 3.80 M entries/s |
-| 8 MiB filesystem file | `encode_path` to counting sink | 1.27 ms | 6.14 GiB/s |
-| 1,000-file filesystem directory | `encode_path` | 6.44 ms | 155 K entries/s |
-| 1,000-file filesystem directory | `encode_path` with case hack | 14.1 ms | 71.1 K entries/s |
+| 4 KiB regular file | `decode_events` | 117 ns | — |
+| 4 KiB regular file | `decode` | 146 ns | — |
+| 4 KiB regular file | `decode_events_reader` + `copy_to` | 234 ns | 16.7 GiB/s |
+| 4 KiB regular file | `decode_events_reader` as `Read` | 292 ns | 13.4 GiB/s |
+| 4 KiB regular file | `encode_tree` to counting sink | 25.6 ns | — |
+| 4 KiB regular file | `hash_tree` | 2.80 µs | 1.40 GiB/s |
+| 1 MiB regular file | `decode_events` | 104 ns | — |
+| 1 MiB regular file | `decode` | 127 ns | — |
+| 1 MiB regular file | `decode_events_reader` + `copy_to` | 19.5 µs | 50.1 GiB/s |
+| 1 MiB regular file | `decode_events_reader` as `Read` | 19.6 µs | 49.8 GiB/s |
+| 1 MiB regular file | `encode_tree` to counting sink | 24.7 ns | — |
+| 1 MiB regular file | `hash_tree` | 686 µs | 1.42 GiB/s |
+| 1,000-entry borrowed directory | `decode_events` | 208 µs | 4.80 M entries/s |
+| 1,000-entry borrowed directory | `decode` | 261 µs | 3.82 M entries/s |
+| 1,000-entry streaming directory | `decode_events_reader` | 297 µs | 3.37 M entries/s |
+| 1,000-entry borrowed directory | `encode_tree` to counting sink | 64.6 µs | 15.5 M entries/s |
+| 1,000-entry borrowed directory | `hash_tree` | 296 µs | 3.38 M entries/s |
+| 8 MiB filesystem file | `encode_path` to counting sink | 1.58 ms | 4.95 GiB/s |
+| 1,000-file filesystem directory | `encode_path` | 6.99 ms | 143 K entries/s |
+| 1,000-file filesystem directory | `encode_path` with case hack | 7.07 ms | 142 K entries/s |
 
 The same run compared filesystem encoding of the installed Nix 2.34.8
 package's 4,060,120-byte NAR through a daemon reporting version 2.34.7. The
@@ -403,8 +413,8 @@ benchmark verified byte-for-byte equality before timing:
 
 | Implementation | Time | Throughput | Relative time |
 | --- | ---: | ---: | ---: |
-| `nix-archive` `encode_path` | 849 µs | 4.45 GiB/s | 1.00× |
-| Nix 2.34.7 daemon `NarFromPath` | 1.88 ms | 2.01 GiB/s | 2.22× |
+| `nix-archive` `encode_path` | 998 µs | 3.79 GiB/s | 1.00× |
+| Nix 2.34.7 daemon `NarFromPath` | 1.90 ms | 1.99 GiB/s | 1.90× |
 
 The Nix result uses the stock daemon's `NarFromPath` worker-protocol operation.
 It includes Unix-socket request and response overhead but excludes connection
@@ -415,9 +425,12 @@ internal encoder in isolation.
 These are Criterion central estimates from one run, so they should be treated
 as indicative rather than universal. Borrowed regular-file decoding does not
 scan the payload, and the counting sink does not copy it; their timings measure
-format traversal and serialization overhead rather than memory bandwidth.
-The Nix comparison runs when a daemon socket and a `nix` executable in `PATH`
-are available, and otherwise skips without failing the other benchmarks.
+format traversal and serialization overhead rather than memory bandwidth. The
+streaming regular-file cases consume the full payload from an in-memory
+`Cursor` into that sink, so they measure decoder and `Read` overhead rather
+than filesystem I/O. The Nix comparison runs when a daemon socket and a `nix`
+executable in `PATH` are available, and otherwise skips without failing the
+other benchmarks.
 
 ```console
 devenv shell -- cargo bench --bench nar

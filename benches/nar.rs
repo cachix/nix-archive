@@ -6,13 +6,13 @@ mod nix_daemon;
 use std::env;
 use std::fs;
 use std::hint::black_box;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nix_archive::nar::{
-    decode, decode_events, encode_path, encode_tree, hash_tree, CaseHack, NamedNode, Node,
-    ReferencePattern,
+    decode, decode_events, decode_events_reader, encode_path, encode_tree, hash_tree, CaseHack,
+    NamedNode, Node, ReadEvent, ReferencePattern,
 };
 use nix_daemon::NixDaemon;
 
@@ -72,6 +72,44 @@ fn bench_regular(c: &mut Criterion) {
             &nar,
             |bencher, nar| bencher.iter(|| black_box(decode(black_box(nar)).unwrap())),
         );
+        // Measure both payload paths: `copy_to` retains the concrete archive
+        // reader type, while using `FileContents` as a `Read` erases it.
+        group.bench_with_input(
+            BenchmarkId::new("decode_events_reader_copy_to", label),
+            &nar,
+            |bencher, nar| {
+                bencher.iter(|| {
+                    let mut reader = Cursor::new(black_box(nar.as_slice()));
+                    let mut sink = CountingSink::default();
+                    decode_events_reader(&mut reader, |event| {
+                        if let ReadEvent::Regular { mut contents, .. } = event {
+                            contents.copy_to(&mut sink)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    black_box(sink.bytes)
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("decode_events_reader_read", label),
+            &nar,
+            |bencher, nar| {
+                bencher.iter(|| {
+                    let mut reader = Cursor::new(black_box(nar.as_slice()));
+                    let mut sink = CountingSink::default();
+                    decode_events_reader(&mut reader, |event| {
+                        if let ReadEvent::Regular { mut contents, .. } = event {
+                            io::copy(&mut contents, &mut sink)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    black_box(sink.bytes)
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("encode_tree_to_sink", label), |bencher| {
             bencher.iter(|| {
                 let mut sink = CountingSink::default();
@@ -124,6 +162,19 @@ fn bench_directory(c: &mut Criterion) {
     });
     group.bench_function("decode_collect", |bencher| {
         bencher.iter(|| black_box(decode(black_box(&nar)).unwrap()));
+    });
+    group.bench_function("decode_events_reader", |bencher| {
+        bencher.iter(|| {
+            let mut reader = Cursor::new(black_box(nar.as_slice()));
+            let mut events = 0usize;
+            decode_events_reader(&mut reader, |event| {
+                black_box(event);
+                events += 1;
+                Ok(())
+            })
+            .unwrap();
+            black_box(events)
+        });
     });
     group.bench_function("encode_tree_to_sink", |bencher| {
         bencher.iter(|| {
