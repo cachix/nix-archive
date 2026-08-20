@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use nix_archive::nar::{
-    decode, encode_path, encode_tree, hash_tree, restore_path, restore_reader, Entry, Error,
+    decode, encode_path, encode_tree, hash_tree, restore, restore_reader, CaseHack, Entry, Error,
     NamedNode, Node,
 };
 
@@ -229,7 +229,7 @@ fn complex_tree_golden_decodes_restores_and_reencodes() {
 
     let tmp = tempfile::tempdir().unwrap();
     let restored = tmp.path().join("restored");
-    restore_path(&nar, &restored).unwrap();
+    restore(&nar, &restored, CaseHack::native()).unwrap();
     assert_eq!(
         fs::read_link(restored.join("aa"))
             .unwrap()
@@ -239,7 +239,7 @@ fn complex_tree_golden_decodes_restores_and_reencodes() {
     );
 
     let mut reencoded = Vec::new();
-    encode_path(&mut reencoded, &restored).unwrap();
+    encode_path(&mut reencoded, &restored, CaseHack::native()).unwrap();
     assert_eq!(reencoded, nar);
 }
 
@@ -296,10 +296,10 @@ fn streaming_restore_handles_fragmented_input() {
     let tmp = tempfile::tempdir().unwrap();
     let restored = tmp.path().join("restored");
     let mut reader = ChunkedReader { remaining: &nar };
-    restore_reader(&mut reader, &restored).unwrap();
+    restore_reader(&mut reader, &restored, CaseHack::native()).unwrap();
 
     let mut reencoded = Vec::new();
-    encode_path(&mut reencoded, &restored).unwrap();
+    encode_path(&mut reencoded, &restored, CaseHack::native()).unwrap();
     assert_eq!(reencoded, nar);
 }
 
@@ -311,7 +311,11 @@ fn streaming_restore_bounds_metadata_tokens() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reader = nar.as_slice();
     assert!(matches!(
-        restore_reader(&mut reader, &tmp.path().join("restored")),
+        restore_reader(
+            &mut reader,
+            &tmp.path().join("restored"),
+            CaseHack::native()
+        ),
         Err(Error::TokenTooLarge {
             size: 1_048_577,
             limit: 1_048_576
@@ -361,7 +365,7 @@ fn restore_rejects_every_existing_destination_kind() {
                 _ => unreachable!(),
             }
 
-            match restore_path(&nar, &destination) {
+            match restore(&nar, &destination, CaseHack::native()) {
                 Err(Error::Io(error)) => assert_eq!(
                     error.kind(),
                     io::ErrorKind::AlreadyExists,
@@ -403,7 +407,7 @@ fn restore_rejects_invalid_destination_names() {
     ];
 
     for destination in bad_destinations {
-        match restore_path(&nar, &destination) {
+        match restore(&nar, &destination, CaseHack::native()) {
             Err(Error::Io(error)) => assert_eq!(
                 error.kind(),
                 io::ErrorKind::InvalidInput,

@@ -2,62 +2,14 @@
 
 #![cfg(unix)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::io::{self, BufReader, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
-use nix_archive::nar::{encode_path, restore_reader, ReferencePattern};
+use nix_archive::nar::{encode_path, restore_reader, CaseHack, ReferencePattern};
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-struct TrackingAllocator;
-
-fn allocated(size: usize) {
-    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for TrackingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            allocated(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            allocated(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, old, new_size) };
-        if !new_ptr.is_null() {
-            if new_size >= old.size() {
-                allocated(new_size - old.size());
-            } else {
-                LIVE_BYTES.fetch_sub(old.size() - new_size, Ordering::Relaxed);
-            }
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+use common::{baseline, peak_growth, serialized};
 
 #[derive(Default)]
 struct CountingSink {
@@ -79,7 +31,7 @@ impl Write for CountingSink {
 
 #[test]
 fn large_file_encoding_and_reference_scanning_have_payload_independent_memory_use() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = serialized();
     const FILE_SIZE: u64 = 32 * 1024 * 1024;
     const MAX_EXTRA_LIVE_BYTES: usize = 2 * 1024 * 1024;
     const HASH: &str = "dc04vv14dak1c1r48qa0m23vr9jy8sm0";
@@ -93,13 +45,12 @@ fn large_file_encoding_and_reference_scanning_have_payload_independent_memory_us
     drop(file);
     let pattern = ReferencePattern::new([HASH]).unwrap();
 
-    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(baseline, Ordering::Relaxed);
+    let before = baseline();
 
     let mut sink = CountingSink::default();
-    encode_path(&mut sink, &path).unwrap();
+    encode_path(&mut sink, &path, CaseHack::native()).unwrap();
 
-    let peak_growth = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+    let growth = peak_growth(before);
     assert!(sink.bytes > FILE_SIZE, "NAR framing was not written");
     assert!(
         sink.largest_write < MAX_EXTRA_LIVE_BYTES,
@@ -107,27 +58,26 @@ fn large_file_encoding_and_reference_scanning_have_payload_independent_memory_us
         sink.largest_write
     );
     assert!(
-        peak_growth < MAX_EXTRA_LIVE_BYTES,
-        "encoding a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
+        growth < MAX_EXTRA_LIVE_BYTES,
+        "encoding a {FILE_SIZE}-byte file grew the live heap by {growth} bytes"
     );
 
-    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(baseline, Ordering::Relaxed);
+    let before = baseline();
 
-    let scan = pattern.scan_path(&path).unwrap();
+    let scan = pattern.scan_path(&path, CaseHack::native()).unwrap();
 
-    let peak_growth = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+    let growth = peak_growth(before);
     assert_eq!(scan.nar_size, sink.bytes);
     assert_eq!(scan.matches, [0]);
     assert!(
-        peak_growth < MAX_EXTRA_LIVE_BYTES,
-        "scanning a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
+        growth < MAX_EXTRA_LIVE_BYTES,
+        "scanning a {FILE_SIZE}-byte file grew the live heap by {growth} bytes"
     );
 }
 
 #[test]
 fn large_file_streaming_restore_has_payload_independent_memory_use() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = serialized();
     const FILE_SIZE: u64 = 32 * 1024 * 1024;
     const MAX_EXTRA_LIVE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -139,20 +89,19 @@ fn large_file_streaming_restore_has_payload_independent_memory_use() {
         .unwrap();
     let archive_path = tmp.path().join("large.nar");
     let mut archive = fs::File::create(&archive_path).unwrap();
-    encode_path(&mut archive, &source).unwrap();
+    encode_path(&mut archive, &source, CaseHack::native()).unwrap();
     drop(archive);
 
-    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(baseline, Ordering::Relaxed);
+    let before = baseline();
 
     let mut archive = BufReader::new(fs::File::open(&archive_path).unwrap());
     let restored = tmp.path().join("restored");
-    restore_reader(&mut archive, &restored).unwrap();
+    restore_reader(&mut archive, &restored, CaseHack::native()).unwrap();
 
-    let peak_growth = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+    let growth = peak_growth(before);
     assert_eq!(fs::metadata(restored).unwrap().len(), FILE_SIZE);
     assert!(
-        peak_growth < MAX_EXTRA_LIVE_BYTES,
-        "restoring a {FILE_SIZE}-byte file grew the live heap by {peak_growth} bytes"
+        growth < MAX_EXTRA_LIVE_BYTES,
+        "restoring a {FILE_SIZE}-byte file grew the live heap by {growth} bytes"
     );
 }

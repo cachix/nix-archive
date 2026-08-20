@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use nix_archive::nar::{decode, encode_path, restore_reader, Entry};
+use nix_archive::nar::{decode, encode_path, restore_reader, CaseHack, Entry};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -104,7 +104,7 @@ mod hostile_bytes {
             let tmp = tempfile::tempdir().unwrap();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut reader = bytes.as_slice();
-                let _ = restore_reader(&mut reader, &tmp.path().join("restored"));
+                let _ = restore_reader(&mut reader, &tmp.path().join("restored"), CaseHack::native());
             }));
             prop_assert!(outcome.is_ok());
         }
@@ -124,13 +124,13 @@ mod valid_trees {
             materialize(&node, &source);
 
             let mut original = Vec::new();
-            encode_path(&mut original, &source).unwrap();
+            encode_path(&mut original, &source, CaseHack::native()).unwrap();
             let entries = decode(&original).unwrap();
 
             let restored = tmp.path().join("restored");
             unpack(&entries, &restored);
             let mut reencoded = Vec::new();
-            encode_path(&mut reencoded, &restored).unwrap();
+            encode_path(&mut reencoded, &restored, CaseHack::native()).unwrap();
 
             prop_assert_eq!(reencoded, original);
         }

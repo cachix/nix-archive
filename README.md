@@ -48,6 +48,68 @@ The unpack destination must not exist. Use `-` in place of `tree.nar` to write
 the packed archive to standard output or read the archive from standard input,
 matching the streams used by `nix nar pack` and `nix-store --restore`.
 
+## Choosing an API
+
+Five ways in, along two axes: whether the archive is already in memory, and
+whether you want a visitor or a data structure.
+
+Names follow one rule: the base name is the in-memory form and `_reader` means
+it takes a `std::io::Read` instead of a `&[u8]`. Anything that touches the
+filesystem also takes a `CaseHack`, because that choice changes the resulting
+NAR bytes and must not be guessed silently; pass `CaseHack::native()` for
+Nix's own default.
+
+| | Contents you get | Allocates | Use when |
+| --- | --- | --- | --- |
+| `decode_events` | `&[u8]` borrowed from the archive, valid as long as it is | nothing | the archive is in memory and you want it fast |
+| `decode` | `&[u8]` borrowed, in a returned `Vec<Entry>` | vector plus a path per entry | you want the tree as data, not a callback |
+| `decode_events_reader` | `FileContents`, a one-pass reader valid only during the visit | depth-bounded name buffers | the archive is arriving, or does not fit |
+| `restore` | written to disk for you | case-collision state | you have the archive and want it on disk |
+| `restore_reader` | written to disk for you | case-collision state | it is arriving and you want it on disk |
+
+The split between the slice decoders and the streaming one is not a
+convenience; neither can be built from the other:
+
+- **Slice cannot be built from stream.** `decode_events` promises contents
+  borrowed from the input, so they outlive the visit and cost no copy. A
+  stream has nothing with that lifetime to give: its bytes live in an 8 KiB
+  buffer that the next read overwrites. That promise is what lets `decode`
+  return a `Vec<Entry>` still pointing into your archive.
+- **Stream cannot be built from slice.** Feeding `decode_events` from a socket
+  means buffering the whole archive first, which is the exact cost the
+  streaming API exists to avoid.
+
+Concretely, on a 4 MiB file: `decode_events` performs zero allocations and
+hands you the payload as one slice, so writing it is a single `write` syscall.
+`decode_events_reader` allocates two depth-bounded buffers and delivers the
+payload as a stream. Read it as a plain `Read` and it arrives in 512 chunks of
+8 KiB; hand it somewhere with `FileContents::copy_to` and the whole payload can
+cross in one `copy_file_range`, because `copy_to` keeps your reader's own type
+rather than erasing it. Pick the trade you want; the type signature tells you
+which one you took.
+
+What they *do* share is vocabulary. Both yield `Event`, which is generic over
+its contents type, so a routine written over `Event<'_, C>` works with either
+decoder:
+
+```rust
+use nix_archive::nar::Event;
+
+fn describe<C>(event: &Event<'_, C>) -> String {
+    match event {
+        Event::DirectoryStart { name } => format!("dir+ {name:?}"),
+        Event::DirectoryEnd { name } => format!("dir- {name:?}"),
+        Event::Regular { name, executable, .. } => format!("file {name:?} {executable}"),
+        Event::Symlink { name, target } => format!("link {name:?} -> {target:?}"),
+    }
+}
+```
+
+`restore` and `restore_reader` are exactly that: one visitor over the two
+decoders, so the case-hack numbering, the directory stack, and the
+descriptor-relative creation cannot drift apart. The two decoders still walk
+the NAR grammar separately; a parity test pins them to the same verdicts.
+
 ## Decode without allocating
 
 `decode_events` borrows names, targets, and contents directly from the input.
@@ -71,6 +133,42 @@ fn payload_bytes(nar: &[u8]) -> Result<usize, Error> {
 For callers that want owned relative paths and post-order traversal, `decode`
 returns a `Vec<Entry>` with every directory after its children. File contents
 and symlink targets remain borrowed from the input archive.
+
+## Decode a stream without buffering it
+
+`decode_events_reader` visits those same events over any `std::io::Read`. A
+file's contents arrive as a reader rather than a slice, so memory use follows
+directory depth and metadata instead of payload size. The reader is consumed
+in small pieces, one per length prefix and one per token, so wrap an
+unbuffered source.
+
+```rust,no_run
+use std::{fs::File, io::{self, BufReader}};
+use nix_archive::nar::{decode_events_reader, Error, ReadEvent};
+
+fn payload_bytes() -> Result<u64, Error> {
+    let mut nar = BufReader::new(File::open("tree.nar")?);
+    let mut total = 0;
+    decode_events_reader(&mut nar, |event| {
+        if let ReadEvent::Regular { mut contents, .. } = event {
+            total += io::copy(&mut contents, &mut io::sink())?;
+        }
+        Ok(())
+    })?;
+    Ok(total)
+}
+```
+
+A visitor that does not read a file to the end is not an error; the decoder
+skips the rest and stays positioned. Metadata tokens are bounded, so a
+malformed archive cannot ask for an unbounded allocation, and the archive must
+be the whole of what remains on the reader. Because nothing is buffered, a
+file's bytes reach the visitor before the node around them has been validated;
+a visitor that cannot act on unverified bytes should hold them until
+`decode_events_reader` returns.
+
+`restore_reader` is this decoder plus a filesystem writer, so it no longer
+walks the grammar itself.
 
 ## Encode a borrowed tree without allocating
 
@@ -109,14 +207,14 @@ fn main() -> Result<(), Error> {
 
 ```rust,no_run
 use std::path::Path;
-use nix_archive::nar::{encode_path, hash_path, Error};
+use nix_archive::nar::{encode_path, hash_path, CaseHack, Error};
 
 fn main() -> Result<(), Error> {
     let path = Path::new("./result");
     let mut nar = Vec::new();
-    encode_path(&mut nar, path)?;
+    encode_path(&mut nar, path, CaseHack::native())?;
 
-    let nar_hash = hash_path(path)?;
+    let nar_hash = hash_path(path, CaseHack::native())?;
     assert_eq!(nar_hash.size, nar.len() as u64);
     Ok(())
 }
@@ -135,7 +233,7 @@ reused for every output of a build:
 
 ```rust,no_run
 use std::path::Path;
-use nix_archive::nar::ReferencePattern;
+use nix_archive::nar::{CaseHack, ReferencePattern};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let candidates = [
@@ -143,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "zc842j0rz61mjsp3h3wp5ly71ak6qgdn",
     ];
     let pattern = ReferencePattern::new(candidates)?;
-    let scan = pattern.scan_path(Path::new("./result"))?;
+    let scan = pattern.scan_path(Path::new("./result"), CaseHack::native())?;
 
     // Indices refer to `candidates`; hash and size came from the same NAR pass.
     println!("{:?} {}", scan.matches, scan.nar_size);
@@ -160,10 +258,10 @@ while processing chunks.
 
 ```rust
 use std::path::Path;
-use nix_archive::nar::{restore_path, Error};
+use nix_archive::nar::{restore, CaseHack, Error};
 
-fn restore(nar: &[u8]) -> Result<(), Error> {
-    restore_path(nar, Path::new("./restored"))
+fn unpack(nar: &[u8]) -> Result<(), Error> {
+    restore(nar, Path::new("./restored"), CaseHack::native())
 }
 ```
 
@@ -172,11 +270,11 @@ For archives that are not already in memory, `restore_reader` accepts any
 
 ```rust,no_run
 use std::{fs::File, io::BufReader, path::Path};
-use nix_archive::nar::{restore_reader, Error};
+use nix_archive::nar::{restore_reader, CaseHack, Error};
 
 fn restore_file() -> Result<(), Error> {
     let mut nar = BufReader::new(File::open("tree.nar")?);
-    restore_reader(&mut nar, Path::new("./restored"))
+    restore_reader(&mut nar, Path::new("./restored"), CaseHack::native())
 }
 ```
 
@@ -186,10 +284,33 @@ partial tree. Child creation is descriptor-relative, so replacing a restored
 directory path with a symlink cannot redirect later writes.
 
 On macOS, Nix represents case-colliding names on disk with suffixes such as
-`~nix~case~hack~1`. `restore_path` and `encode_path` use the same native
-default as Nix: enabled on macOS and disabled elsewhere. The
-`*_with_case_hack` functions accept an explicit `CaseHack` setting for tools,
-tests, and cross-platform processing.
+`~nix~case~hack~1`. `restore` and `encode_path` reproduce Nix's compiled-in
+default for its `use-case-hack` setting: enabled on macOS, disabled elsewhere.
+
+That default is a proxy. What the hack really tracks is whether the local
+filesystem is case-insensitive, and macOS is only Nix's stand-in for it. This
+crate follows the proxy deliberately, because NAR bytes feed store-path
+identity and guessing differently from Nix would yield different store paths
+for the same tree.
+
+The proxy is loose enough that people correct it by hand. macOS users who
+created a case-sensitive APFS volume commonly set `use-case-hack = false`,
+since on such a volume the hack is not just unnecessary: with it enabled, a
+legitimate file named `notes~nix~case~hack~1` is dumped as `notes`. Measured
+on this crate, that single file changes the archive from 304 bytes to 288 and
+gives a different hash. For a tree carrying no such suffix, which is nearly
+every tree, both settings produce byte-identical output, so flipping the
+setting is safe exactly where it is a no-op.
+
+So `encode_path`, `hash_path`, `restore`, `restore_reader`, and
+`ReferencePattern::scan_path` all take a `CaseHack` argument rather than
+defaulting it. A hash-affecting input that real installations vary should not
+be inferred from `cfg!(target_os)` behind the caller's back; `CaseHack::native()`
+asks for Nix's default in one visible token, and a tool that reads
+`nix config show use-case-hack` can pass what it found instead.
+
+The `nix-archive` command exposes the same choice as `--case-hack
+<native|enabled|disabled>`.
 
 ## Allocation behavior
 
@@ -197,12 +318,14 @@ tests, and cross-platform processing.
 | --- | --- |
 | `decode_events` | Zero allocations on valid input with an allocation-free visitor |
 | `decode` | Allocates the result vector and paths; payloads and symlink targets remain borrowed |
+| `decode_events_reader` | Payload-independent; allocates depth-bounded name buffers and one reused symlink-target buffer |
 | `encode_tree` | Zero allocations with an allocation-free writer |
 | `hash_tree` | Zero allocations |
 | `encode_path` / `hash_path` | Allocates directory metadata; streams file payloads |
 | `ReferencePattern` | Allocates candidate lookup state once; clones share it |
 | `ReferenceScanner` / `ReferenceWriter` | Allocates match state at construction; no allocations while scanning |
-| `restore_path` / `restore_reader` | Payload-independent; allocates depth-bounded name buffers and case-collision state |
+| `restore` | Allocates the directory stack, plus per-directory collision state when the case hack is on; payloads are never copied |
+| `restore_reader` | Payload-independent; the same, plus `decode_events_reader`'s buffers |
 
 These guarantees have allocator-counting integration tests rather than being
 inferred from bounded memory use.

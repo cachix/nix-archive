@@ -5,7 +5,7 @@
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 
-use nix_archive::nar::{decode, encode_path, Entry};
+use nix_archive::nar::{decode, encode_path, CaseHack, Entry};
 
 fn open_fd_count() -> Option<usize> {
     fs::read_dir("/proc/self/fd").ok().map(Iterator::count)
@@ -27,7 +27,7 @@ fn thousand_file_directory_is_sorted_without_fd_leaks() {
 
     let before = open_fd_count();
     let mut nar = Vec::new();
-    encode_path(&mut nar, &root).unwrap();
+    encode_path(&mut nar, &root, CaseHack::native()).unwrap();
     let after = open_fd_count();
 
     if let (Some(before), Some(after)) = (before, after) {

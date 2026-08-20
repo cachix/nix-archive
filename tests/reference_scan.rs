@@ -4,9 +4,7 @@
 
 use std::fs;
 
-use nix_archive::nar::{
-    hash_path, hash_path_with_case_hack, hash_tree, CaseHack, NamedNode, Node, ReferencePattern,
-};
+use nix_archive::nar::{hash_path, hash_tree, CaseHack, NamedNode, Node, ReferencePattern};
 
 const NAME_HASH: &str = "dc04vv14dak1c1r48qa0m23vr9jy8sm0";
 const CONTENT_HASH: &str = "zc842j0rz61mjsp3h3wp5ly71ak6qgdn";
@@ -69,8 +67,8 @@ fn filesystem_scan_hashes_and_scans_in_one_nar_pass() {
 
     let pattern =
         ReferencePattern::new([NAME_HASH, CONTENT_HASH, TARGET_HASH, MISSING_HASH]).unwrap();
-    let scan = pattern.scan_path(&root).unwrap();
-    let nar_hash = hash_path(&root).unwrap();
+    let scan = pattern.scan_path(&root, CaseHack::native()).unwrap();
+    let nar_hash = hash_path(&root, CaseHack::native()).unwrap();
 
     assert_eq!(scan.matches, [0, 1, 2]);
     assert_eq!(scan.nar_size, nar_hash.size);
@@ -106,8 +104,8 @@ fn explicit_case_hack_modes_scan_the_exact_nar_they_hash() {
     let pattern = ReferencePattern::new([NAME_HASH, CONTENT_HASH]).unwrap();
 
     for case_hack in [CaseHack::Disabled, CaseHack::Enabled] {
-        let scan = pattern.scan_path_with_case_hack(&root, case_hack).unwrap();
-        let expected = hash_path_with_case_hack(&root, case_hack).unwrap();
+        let scan = pattern.scan_path(&root, case_hack).unwrap();
+        let expected = hash_path(&root, case_hack).unwrap();
 
         assert_eq!(scan.matches, [0, 1]);
         assert_eq!(scan.nar_size, expected.size);

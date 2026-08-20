@@ -22,6 +22,18 @@ use crate::wire::{describe_bytes, pad_len, write_token, MAGIC, MAX_DEPTH};
 pub const CASE_HACK_SUFFIX: &[u8] = b"~nix~case~hack~";
 
 /// Whether filesystem encoding/restoration applies Nix's case-collision hack.
+///
+/// Nix exposes this as the runtime `use-case-hack` setting, so an
+/// installation can have it either way on any platform. macOS users who
+/// created a case-sensitive APFS volume routinely set it to false, because on
+/// such a volume the hack is not merely unnecessary: it rewrites any
+/// legitimate name that happens to contain the suffix.
+///
+/// The setting is a no-op for a tree that carries no case-hack suffix, which
+/// is nearly all of them, and only changes the NAR for one that does.
+/// [`native`](Self::native) reproduces Nix's default; pass an explicit value
+/// to follow a specific installation, or to process an archive whose
+/// provenance differs from the current host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaseHack {
     Disabled,
@@ -29,7 +41,16 @@ pub enum CaseHack {
 }
 
 impl CaseHack {
-    /// Nix enables the hack by default on macOS and disables it elsewhere.
+    /// Nix's compiled-in default for `use-case-hack`: enabled on macOS,
+    /// disabled elsewhere.
+    ///
+    /// This mirrors what Nix ships rather than probing whether the filesystem
+    /// is genuinely case-insensitive. The distinction matters because NAR
+    /// bytes feed store-path identity: guessing differently from Nix would
+    /// produce different store paths for the same tree. macOS is Nix's proxy
+    /// for a case-insensitive filesystem, and matching the proxy is what keeps
+    /// hashes identical. Run `nix config show use-case-hack` when an
+    /// installation may have overridden it.
     pub const fn native() -> Self {
         if cfg!(target_os = "macos") {
             Self::Enabled
@@ -40,12 +61,6 @@ impl CaseHack {
 
     pub(crate) const fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
-    }
-}
-
-impl Default for CaseHack {
-    fn default() -> Self {
-        Self::native()
     }
 }
 
@@ -105,17 +120,15 @@ pub fn hash_tree(tree: &Node<'_>) -> Result<NarHash, Error> {
 
 /// Serialize the filesystem tree at `path` as a NAR into `w`.
 ///
-/// Matches Nix's native defaults: directory entries in ascending byte order,
-/// owner-execute determines executability, and the case hack is enabled by
-/// default only on macOS. File payloads are streamed rather than buffered.
-/// Once the root is opened, traversal is descriptor-relative and does not
-/// follow symlinks swapped into the tree concurrently.
-pub fn encode_path(w: &mut (impl Write + ?Sized), path: &Path) -> Result<(), Error> {
-    encode_path_with_case_hack(w, path, CaseHack::native())
-}
-
-/// [`encode_path`] with an explicit Nix case-hack setting.
-pub fn encode_path_with_case_hack(
+/// Matches Nix's native behavior: directory entries in ascending byte order,
+/// owner-execute determines executability. File payloads are streamed rather
+/// than buffered. Once the root is opened, traversal is descriptor-relative
+/// and does not follow symlinks swapped into the tree concurrently.
+///
+/// `case_hack` is required rather than defaulted because it changes the bytes
+/// written, and therefore the hash. Pass [`CaseHack::native`] to reproduce
+/// Nix's own default.
+pub fn encode_path(
     w: &mut (impl Write + ?Sized),
     path: &Path,
     case_hack: CaseHack,
@@ -129,15 +142,35 @@ pub fn encode_path_with_case_hack(
 /// These values are what a `PathInfo` carries as `nar_size` / `nar_sha256`, and
 /// what a fixed output derivation with `outputHashMode = "recursive"` is
 /// verified against.
-pub fn hash_path(path: &Path) -> Result<NarHash, Error> {
-    hash_path_with_case_hack(path, CaseHack::native())
+///
+/// `case_hack` is required rather than defaulted because it changes the hash.
+/// Pass [`CaseHack::native`] to reproduce Nix's own default.
+pub fn hash_path(path: &Path, case_hack: CaseHack) -> Result<NarHash, Error> {
+    let mut sink = HashSink::new();
+    encode_path(&mut sink, path, case_hack)?;
+    Ok(sink.finish())
 }
 
-/// [`hash_path`] with an explicit Nix case-hack setting.
+/// Renamed to [`encode_path`], which now takes the setting directly.
+#[deprecated(
+    since = "0.3.0",
+    note = "use `encode_path`, which now takes `case_hack` directly"
+)]
+pub fn encode_path_with_case_hack(
+    w: &mut (impl Write + ?Sized),
+    path: &Path,
+    case_hack: CaseHack,
+) -> Result<(), Error> {
+    encode_path(w, path, case_hack)
+}
+
+/// Renamed to [`hash_path`], which now takes the setting directly.
+#[deprecated(
+    since = "0.3.0",
+    note = "use `hash_path`, which now takes `case_hack` directly"
+)]
 pub fn hash_path_with_case_hack(path: &Path, case_hack: CaseHack) -> Result<NarHash, Error> {
-    let mut sink = HashSink::new();
-    encode_path_with_case_hack(&mut sink, path, case_hack)?;
-    Ok(sink.finish())
+    hash_path(path, case_hack)
 }
 
 /// Serialize a single regular file from in-memory bytes as a complete NAR.
@@ -480,7 +513,7 @@ mod tests {
                 std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let mut from_fs = Vec::new();
-            encode_path(&mut from_fs, &file).unwrap();
+            encode_path(&mut from_fs, &file, CaseHack::native()).unwrap();
             let mut from_bytes = Vec::new();
             encode_regular(&mut from_bytes, contents, executable).unwrap();
             assert_eq!(from_bytes, from_fs);

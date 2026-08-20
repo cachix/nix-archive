@@ -11,51 +11,178 @@ use std::path::Path;
 
 use rustix::fs::{Mode, OFlags};
 
-use crate::dec::validate_name;
-use crate::nar::{decode_events, CaseHack, Error, Event, CASE_HACK_SUFFIX};
-use crate::wire::{describe_bytes, ERROR_PREVIEW_BYTES, MAGIC, MAX_DEPTH};
+use crate::nar::{
+    decode_events, decode_events_reader, CaseHack, Error, Event, FileContents, CASE_HACK_SUFFIX,
+};
+use crate::wire::describe_bytes;
 
-/// Names and symlink targets ultimately have to fit in a filesystem object.
-/// Keep malformed streamed archives from requesting an effectively unbounded
-/// allocation before the operating system can reject them.
-const MAX_METADATA_TOKEN: usize = 1024 * 1024;
-const MAX_CONTROL_TOKEN: usize = 16;
-
-/// Restore a NAR at `destination` using Nix's native case-hack default.
+/// Restore a NAR at `destination`.
+///
+/// **Choose this when the archive is already in memory.**
+///
+/// Pros: a file's payload is one borrowed slice, so it reaches disk in a
+/// single `write`; no decoding allocation beyond the case-collision state.
+///
+/// Cons: `nar` must be fully in memory. Use [`restore_reader`] when it is not.
+///
+/// `case_hack` is required rather than defaulted because it decides which
+/// names land on disk, and so the hash of any archive dumped from the result.
+/// Pass [`CaseHack::native`] to reproduce Nix's own default.
 ///
 /// The destination itself must not exist and its final lexical component must
 /// not be empty, `.` or `..`. An error can leave a partially restored tree
 /// behind. Child creation is descriptor-relative, so replacing a directory
 /// path with a symlink cannot redirect later writes.
-pub fn restore_path(nar: &[u8], destination: &Path) -> Result<(), Error> {
-    restore_path_with_case_hack(nar, destination, CaseHack::native())
+pub fn restore(nar: &[u8], destination: &Path, case_hack: CaseHack) -> Result<(), Error> {
+    let mut visitor = RestoreVisitor::new(destination, case_hack)?;
+    decode_events(nar, |event| visitor.visit(event))?;
+    visitor.finish();
+    Ok(())
 }
 
-/// [`restore_path`] with an explicit Nix case-hack setting.
+/// Restore a NAR read from `reader`.
+///
+/// **Choose this when the archive is arriving, or is too large to hold.**
+///
+/// Pros: memory use is bounded by directory depth and metadata rather than
+/// payload size, so an archive of any size can be restored; contents go
+/// straight from `reader` to disk without ever being held, and because `R` is
+/// carried rather than erased, a file-backed archive copies payloads in the
+/// kernel rather than a chunk at a time through userspace.
+///
+/// Cons: metadata tokens are bounded, so a few archives [`restore`] accepts
+/// are rejected; `reader`'s framing is consumed in small pieces, so wrap an
+/// unbuffered source in a [`BufReader`](std::io::BufReader), and the archive
+/// must be the whole of what remains on it.
+///
+/// `case_hack` carries the same requirement as in [`restore`]. The destination
+/// and partial-restoration guarantees are otherwise the same.
+pub fn restore_reader<R: Read + ?Sized>(
+    reader: &mut R,
+    destination: &Path,
+    case_hack: CaseHack,
+) -> Result<(), Error> {
+    let mut visitor = RestoreVisitor::new(destination, case_hack)?;
+    decode_events_reader(reader, |event| visitor.visit(event))?;
+    visitor.finish();
+    Ok(())
+}
+
+/// Renamed to [`restore`], which now takes the setting directly.
+#[deprecated(
+    since = "0.3.0",
+    note = "use `restore`, which takes a destination path and `case_hack` directly"
+)]
+pub fn restore_path(nar: &[u8], destination: &Path) -> Result<(), Error> {
+    restore(nar, destination, CaseHack::native())
+}
+
+/// Renamed to [`restore`], which now takes the setting directly.
+#[deprecated(
+    since = "0.3.0",
+    note = "use `restore`, which now takes `case_hack` directly"
+)]
 pub fn restore_path_with_case_hack(
     nar: &[u8],
     destination: &Path,
     case_hack: CaseHack,
 ) -> Result<(), Error> {
-    let root = RestoreRoot::new(destination)?;
-    let mut directories = Vec::<DirectoryState>::new();
+    restore(nar, destination, case_hack)
+}
 
-    decode_events(nar, |event| {
+/// Renamed to [`restore_reader`], which now takes the setting directly.
+#[deprecated(
+    since = "0.3.0",
+    note = "use `restore_reader`, which now takes `case_hack` directly"
+)]
+pub fn restore_reader_with_case_hack<R: Read + ?Sized>(
+    reader: &mut R,
+    destination: &Path,
+    case_hack: CaseHack,
+) -> Result<(), Error> {
+    restore_reader(reader, destination, case_hack)
+}
+
+/// How a decoder presents a regular file's contents to the file created for
+/// it.
+///
+/// This is the only thing that differs between the two restore paths, so it is
+/// the only thing they state separately: [`decode_events`] hands over a whole
+/// payload as one borrowed slice, [`decode_events_reader`] streams it. A third
+/// contents flavor is a new impl here rather than an edit at every call site.
+trait Contents {
+    fn write_to(self, file: &mut fs::File) -> io::Result<()>;
+}
+
+impl Contents for &[u8] {
+    fn write_to(self, file: &mut fs::File) -> io::Result<()> {
+        file.write_all(self)
+    }
+}
+
+impl<R: Read + ?Sized> Contents for FileContents<'_, R> {
+    fn write_to(mut self, file: &mut fs::File) -> io::Result<()> {
+        // `copy_to` rather than `io::copy` on the `Read` impl: it keeps the
+        // archive's reader type concrete, so a file-backed archive restores
+        // through the kernel instead of one userspace round trip per chunk.
+        self.copy_to(file).map(drop)
+    }
+}
+
+/// Turns decoder events into a filesystem tree.
+///
+/// Both restore APIs are this visitor over one of the two decoders, and differ
+/// only in which [`Contents`] impl the decoder's payload type selects.
+/// Everything that could otherwise drift between the two, the case-hack
+/// numbering, the directory stack, the descriptor-relative creation, lives
+/// here once.
+struct RestoreVisitor {
+    root: RestoreRoot,
+    directories: Vec<DirectoryState>,
+    case_hack: CaseHack,
+}
+
+impl RestoreVisitor {
+    fn new(destination: &Path, case_hack: CaseHack) -> Result<Self, Error> {
+        Ok(Self {
+            root: RestoreRoot::new(destination)?,
+            directories: Vec::new(),
+            case_hack,
+        })
+    }
+
+    /// Resolve where a child belongs, then act on it there.
+    ///
+    /// The parent descriptor and the on-disk name are handed to `act` rather
+    /// than returned, which keeps the borrow of `self` inside the call and the
+    /// case-hack name borrowed rather than copied.
+    fn with_place<T>(
+        &mut self,
+        name: Option<&[u8]>,
+        act: impl FnOnce(&fs::File, &OsStr) -> io::Result<T>,
+    ) -> Result<T, Error> {
+        let placed = match name {
+            Some(name) => {
+                let case_hack = self.case_hack;
+                let parent = self.directories.last_mut().unwrap_or_else(|| {
+                    unreachable!("the decoder emits children only inside directories")
+                });
+                let disk_name = parent.disk_name(name, case_hack)?;
+                act(&parent.directory, &disk_name)
+            }
+            None => act(&self.root.parent, &self.root.name),
+        };
+        Ok(placed?)
+    }
+
+    fn visit<C: Contents>(&mut self, event: Event<'_, C>) -> Result<(), Error> {
         match event {
             Event::DirectoryStart { name } => {
-                let directory = if let Some(name) = name {
-                    let parent = directories.last_mut().unwrap_or_else(|| {
-                        unreachable!("the decoder emits children only inside directories")
-                    });
-                    let disk_name = parent.disk_name(name, case_hack)?;
-                    create_directory_at(&parent.directory, &disk_name)?
-                } else {
-                    create_directory_at(&root.parent, &root.name)?
-                };
-                directories.push(DirectoryState::new(directory));
+                let directory = self.with_place(name, create_directory_at)?;
+                self.directories.push(DirectoryState::new(directory));
             }
             Event::DirectoryEnd { .. } => {
-                directories
+                self.directories
                     .pop()
                     .unwrap_or_else(|| unreachable!("the decoder emits balanced directory events"));
             }
@@ -64,319 +191,22 @@ pub fn restore_path_with_case_hack(
                 executable,
                 contents,
             } => {
-                let mut file = if let Some(name) = name {
-                    let parent = directories.last_mut().unwrap_or_else(|| {
-                        unreachable!("the decoder emits children only inside directories")
-                    });
-                    let disk_name = parent.disk_name(name, case_hack)?;
-                    create_regular_at(&parent.directory, &disk_name)?
-                } else {
-                    create_regular_at(&root.parent, &root.name)?
-                };
-                file.write_all(contents)?;
+                let mut file = self.with_place(name, create_regular_at)?;
+                contents.write_to(&mut file)?;
                 let mode = if executable { 0o755 } else { 0o644 };
                 file.set_permissions(fs::Permissions::from_mode(mode))?;
             }
             Event::Symlink { name, target } => {
-                if let Some(name) = name {
-                    let parent = directories.last_mut().unwrap_or_else(|| {
-                        unreachable!("the decoder emits children only inside directories")
-                    });
-                    let disk_name = parent.disk_name(name, case_hack)?;
-                    create_symlink_at(&parent.directory, &disk_name, target)?;
-                } else {
-                    create_symlink_at(&root.parent, &root.name, target)?;
-                }
+                self.with_place(name, |parent, disk_name| {
+                    create_symlink_at(parent, disk_name, target)
+                })?;
             }
         }
         Ok(())
-    })?;
-
-    debug_assert!(directories.is_empty());
-    Ok(())
-}
-
-/// Restore a NAR read from `reader` using Nix's native case-hack default.
-///
-/// Unlike [`restore_path`], this API does not require the complete archive in
-/// memory. Regular-file contents are copied directly from `reader` to disk;
-/// memory use is bounded by directory depth and metadata rather than payload
-/// size. The destination and partial-restoration guarantees are otherwise the
-/// same as [`restore_path`].
-pub fn restore_reader(reader: &mut (impl Read + ?Sized), destination: &Path) -> Result<(), Error> {
-    restore_reader_with_case_hack(reader, destination, CaseHack::native())
-}
-
-/// [`restore_reader`] with an explicit Nix case-hack setting.
-pub fn restore_reader_with_case_hack(
-    reader: &mut (impl Read + ?Sized),
-    destination: &Path,
-    case_hack: CaseHack,
-) -> Result<(), Error> {
-    let root = RestoreRoot::new(destination)?;
-    let mut cursor = ReaderCursor::new(reader);
-    cursor.expect_magic()?;
-    restore_node(&mut cursor, &root.parent, &root.name, case_hack, 0)?;
-    if cursor.is_exhausted()? {
-        Ok(())
-    } else {
-        Err(Error::TrailingBytes)
-    }
-}
-
-fn restore_node<R: Read + ?Sized>(
-    cursor: &mut ReaderCursor<'_, R>,
-    parent: &fs::File,
-    disk_name: &OsStr,
-    case_hack: CaseHack,
-    depth: usize,
-) -> Result<(), Error> {
-    if depth >= MAX_DEPTH {
-        return Err(Error::MaxDepth(MAX_DEPTH));
     }
 
-    cursor.expect("(")?;
-    cursor.expect("type")?;
-    let node_type = cursor.read_control("regular, symlink or directory")?;
-
-    match node_type.as_bytes() {
-        b"regular" => {
-            let token = cursor.read_control("contents")?;
-            let executable = if token.as_bytes() == b"executable" {
-                cursor.expect("")?;
-                cursor.expect("contents")?;
-                true
-            } else if token.as_bytes() == b"contents" {
-                false
-            } else {
-                return Err(Error::UnexpectedToken {
-                    expected: "contents",
-                    got: describe_bytes(token.as_bytes()),
-                });
-            };
-
-            let mut file = create_regular_at(parent, disk_name)?;
-            cursor.copy_token_to(&mut file)?;
-            cursor.expect(")")?;
-            let mode = if executable { 0o755 } else { 0o644 };
-            file.set_permissions(fs::Permissions::from_mode(mode))?;
-        }
-        b"symlink" => {
-            cursor.expect("target")?;
-            let mut target = Vec::new();
-            cursor.read_bytes(&mut target, MAX_METADATA_TOKEN)?;
-            cursor.expect(")")?;
-            create_symlink_at(parent, disk_name, &target)?;
-        }
-        b"directory" => {
-            let directory = create_directory_at(parent, disk_name)?;
-            let mut state = DirectoryState::new(directory);
-            let mut previous_name = Vec::new();
-            let mut child_name = Vec::new();
-
-            loop {
-                let token = cursor.read_control("entry or )")?;
-                if token.as_bytes() == b")" {
-                    break;
-                }
-                if token.as_bytes() != b"entry" {
-                    return Err(Error::UnexpectedToken {
-                        expected: "entry or )",
-                        got: describe_bytes(token.as_bytes()),
-                    });
-                }
-
-                cursor.expect("(")?;
-                cursor.expect("name")?;
-                cursor.read_bytes(&mut child_name, MAX_METADATA_TOKEN)?;
-                validate_name(&child_name)?;
-                if !previous_name.is_empty() && child_name <= previous_name {
-                    return Err(Error::UnsortedEntries(
-                        describe_bytes(&child_name),
-                        describe_bytes(&previous_name),
-                    ));
-                }
-                cursor.expect("node")?;
-                let child_disk_name = state.disk_name(&child_name, case_hack)?;
-                restore_node(
-                    cursor,
-                    &state.directory,
-                    &child_disk_name,
-                    case_hack,
-                    depth + 1,
-                )?;
-                cursor.expect(")")?;
-
-                std::mem::swap(&mut previous_name, &mut child_name);
-                child_name.clear();
-            }
-        }
-        _ => {
-            return Err(Error::UnexpectedToken {
-                expected: "regular, symlink or directory",
-                got: describe_bytes(node_type.as_bytes()),
-            })
-        }
-    }
-
-    Ok(())
-}
-
-struct ReaderCursor<'a, R: ?Sized> {
-    reader: &'a mut R,
-}
-
-impl<'a, R: Read + ?Sized> ReaderCursor<'a, R> {
-    fn new(reader: &'a mut R) -> Self {
-        Self { reader }
-    }
-
-    fn expect_magic(&mut self) -> Result<(), Error> {
-        let result = (|| {
-            let len = self.read_len()?;
-            if len != MAGIC.len() as u64 {
-                return Err(Error::BadMagic);
-            }
-            let mut magic = [0; MAGIC.len()];
-            self.read_exact(&mut magic)?;
-            self.read_padding(len)?;
-            if magic == MAGIC {
-                Ok(())
-            } else {
-                Err(Error::BadMagic)
-            }
-        })();
-        match result {
-            Err(Error::Io(error)) => Err(Error::Io(error)),
-            Err(_) => Err(Error::BadMagic),
-            Ok(()) => Ok(()),
-        }
-    }
-
-    fn expect(&mut self, expected: &'static str) -> Result<(), Error> {
-        let len = self.read_len()?;
-        if len != expected.len() as u64 {
-            return Err(Error::UnexpectedToken {
-                expected,
-                got: self.read_description(len)?,
-            });
-        }
-
-        let mut bytes = [0; MAX_CONTROL_TOKEN];
-        let actual = &mut bytes[..expected.len()];
-        self.read_exact(actual)?;
-        self.read_padding(len)?;
-        if actual == expected.as_bytes() {
-            Ok(())
-        } else {
-            Err(Error::UnexpectedToken {
-                expected,
-                got: describe_bytes(actual),
-            })
-        }
-    }
-
-    fn read_control(&mut self, expected: &'static str) -> Result<ControlToken, Error> {
-        let len = self.read_len()?;
-        if len > MAX_CONTROL_TOKEN as u64 {
-            return Err(Error::UnexpectedToken {
-                expected,
-                got: self.read_description(len)?,
-            });
-        }
-
-        let mut token = ControlToken {
-            bytes: [0; MAX_CONTROL_TOKEN],
-            len: len as usize,
-        };
-        self.read_exact(&mut token.bytes[..token.len])?;
-        self.read_padding(len)?;
-        Ok(token)
-    }
-
-    fn read_bytes(&mut self, bytes: &mut Vec<u8>, limit: usize) -> Result<(), Error> {
-        let len = self.read_len()?;
-        if len > limit as u64 {
-            return Err(Error::TokenTooLarge { size: len, limit });
-        }
-        let len = len as usize;
-        bytes.clear();
-        bytes.resize(len, 0);
-        self.read_exact(bytes)?;
-        self.read_padding(len as u64)
-    }
-
-    fn copy_token_to(&mut self, writer: &mut impl Write) -> Result<(), Error> {
-        let len = self.read_len()?;
-        let copied = {
-            let mut contents = (&mut *self.reader).take(len);
-            io::copy(&mut contents, writer)?
-        };
-        if copied != len {
-            return Err(Error::UnexpectedEof);
-        }
-        self.read_padding(len)
-    }
-
-    fn read_len(&mut self) -> Result<u64, Error> {
-        let mut bytes = [0; 8];
-        self.read_exact(&mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    fn read_padding(&mut self, len: u64) -> Result<(), Error> {
-        let padding_len = ((8 - len % 8) % 8) as usize;
-        let mut padding = [0; 7];
-        self.read_exact(&mut padding[..padding_len])?;
-        if padding[..padding_len].iter().any(|&byte| byte != 0) {
-            Err(Error::BadPadding)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn read_description(&mut self, len: u64) -> Result<String, Error> {
-        let preview_len = len.min(ERROR_PREVIEW_BYTES as u64) as usize;
-        let mut preview = vec![0; preview_len];
-        self.read_exact(&mut preview)?;
-        let mut description = describe_bytes(&preview);
-        if len > preview_len as u64 {
-            description.push('…');
-        }
-        Ok(description)
-    }
-
-    fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), Error> {
-        self.reader.read_exact(bytes).map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                Error::UnexpectedEof
-            } else {
-                Error::Io(error)
-            }
-        })
-    }
-
-    fn is_exhausted(&mut self) -> Result<bool, Error> {
-        let mut byte = [0];
-        loop {
-            match self.reader.read(&mut byte) {
-                Ok(0) => return Ok(true),
-                Ok(_) => return Ok(false),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(Error::Io(error)),
-            }
-        }
-    }
-}
-
-struct ControlToken {
-    bytes: [u8; MAX_CONTROL_TOKEN],
-    len: usize,
-}
-
-impl ControlToken {
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
+    fn finish(self) {
+        debug_assert!(self.directories.is_empty());
     }
 }
 

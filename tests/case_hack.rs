@@ -7,8 +7,8 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 
 use nix_archive::nar::{
-    decode, encode_path_with_case_hack, encode_tree, restore_path_with_case_hack, CaseHack, Entry,
-    Error, NamedNode, Node, CASE_HACK_SUFFIX,
+    decode, encode_path, encode_tree, restore, CaseHack, Entry, Error, NamedNode, Node,
+    CASE_HACK_SUFFIX,
 };
 
 fn three_way_case_collision_nar() -> Vec<u8> {
@@ -52,7 +52,7 @@ fn restore_numbers_case_collisions_and_dump_undoes_them() {
     let tmp = tempfile::tempdir().unwrap();
     let restored = tmp.path().join("restored");
 
-    restore_path_with_case_hack(&nar, &restored, CaseHack::Enabled).unwrap();
+    restore(&nar, &restored, CaseHack::Enabled).unwrap();
 
     assert_eq!(fs::read(restored.join("FOO")).unwrap(), b"upper");
     assert!(restored.join("Foo~nix~case~hack~1").is_dir());
@@ -62,7 +62,7 @@ fn restore_numbers_case_collisions_and_dump_undoes_them() {
     );
 
     let mut dumped = Vec::new();
-    encode_path_with_case_hack(&mut dumped, &restored, CaseHack::Enabled).unwrap();
+    encode_path(&mut dumped, &restored, CaseHack::Enabled).unwrap();
     assert_eq!(dumped, nar, "case-hack restore/dump did not round trip");
 }
 
@@ -96,7 +96,7 @@ fn restore_rejects_a_generated_name_that_collides_with_an_explicit_name() {
     let tmp = tempfile::tempdir().unwrap();
 
     assert!(matches!(
-        restore_path_with_case_hack(&nar, &tmp.path().join("out"), CaseHack::Enabled),
+        restore(&nar, &tmp.path().join("out"), CaseHack::Enabled),
         Err(Error::CaseHackRestoreCollision { .. })
     ));
 }
@@ -110,7 +110,7 @@ fn dump_strips_from_first_suffix_and_sorts_by_the_unhacked_name() {
     fs::write(root.join("a~nix~case~hack~99ignored"), b"hacked").unwrap();
 
     let mut nar = Vec::new();
-    encode_path_with_case_hack(&mut nar, &root, CaseHack::Enabled).unwrap();
+    encode_path(&mut nar, &root, CaseHack::Enabled).unwrap();
     let entries = decode(&nar).unwrap();
     let regular: Vec<_> = entries
         .iter()
@@ -144,7 +144,7 @@ fn dump_rejects_true_collision_after_suffix_removal() {
 
     let mut nar = Vec::new();
     assert!(matches!(
-        encode_path_with_case_hack(&mut nar, &root, CaseHack::Enabled),
+        encode_path(&mut nar, &root, CaseHack::Enabled),
         Err(Error::CaseHackEncodeCollision(..))
     ));
 }
