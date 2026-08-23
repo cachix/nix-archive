@@ -28,7 +28,7 @@ mode handling use Unix APIs.
 
 ```toml
 [dependencies]
-nix-archive = "0.3"
+nix-archive = "0.4"
 ```
 
 The optional `cli` feature provides a small command-line tool for packing and
