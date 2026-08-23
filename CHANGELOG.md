@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Add `Encoder` and `RegularWriter` for validated root-first encoding of
+  asynchronous or externally backed trees with streamed regular-file payloads.
+
 ## [0.3.0] - 2026-08-20
 
 ### Added

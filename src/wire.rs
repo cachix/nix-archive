@@ -32,6 +32,27 @@ pub(crate) fn describe_bytes(bytes: &[u8]) -> String {
     description
 }
 
+/// Check a directory entry's name and its position relative to the preceding
+/// entry. NAR children must be in strictly increasing raw-byte order.
+pub(crate) fn validate_child_name(name: &[u8], previous: Option<&[u8]>) -> Result<(), Error> {
+    validate_name(name)?;
+    match previous {
+        Some(previous) if name <= previous => Err(Error::UnsortedEntries(
+            describe_bytes(name),
+            describe_bytes(previous),
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn validate_name(name: &[u8]) -> Result<(), Error> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
+    {
+        return Err(Error::InvalidName(describe_bytes(name)));
+    }
+    Ok(())
+}
+
 /// Write one token.
 pub(crate) fn write_token(w: &mut (impl Write + ?Sized), bytes: &[u8]) -> std::io::Result<()> {
     w.write_all(&(bytes.len() as u64).to_le_bytes())?;

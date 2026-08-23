@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod dec;
-mod enc;
+mod encoder;
 mod refscan;
 mod restore;
 mod wire;
@@ -24,6 +24,9 @@ mod wire;
 /// - [`encode_tree`](crate::nar::encode_tree) and
 ///   [`hash_tree`](crate::nar::hash_tree) serialize an already-sorted borrowed
 ///   tree without allocating when the writer does not allocate.
+/// - [`Encoder`](crate::nar::Encoder) serializes validated root-first events
+///   and streams externally backed regular-file contents through
+///   [`RegularWriter`](crate::nar::RegularWriter).
 /// - [`encode_path`](crate::nar::encode_path) and
 ///   [`hash_path`](crate::nar::hash_path) allocate directory-name metadata for
 ///   canonical sorting, while file payloads remain streaming.
@@ -39,12 +42,12 @@ pub mod nar {
     pub use crate::dec::{
         decode, decode_events, decode_events_reader, Entry, Event, FileContents, ReadEvent,
     };
-    pub use crate::enc::{
+    pub use crate::encoder::{
         encode_path, encode_regular, encode_tree, hash_path, hash_regular, hash_tree, CaseHack,
-        NamedNode, NarHash, Node, CASE_HACK_SUFFIX,
+        Encoder, NamedNode, NarHash, Node, RegularWriter, CASE_HACK_SUFFIX,
     };
     #[allow(deprecated)]
-    pub use crate::enc::{encode_path_with_case_hack, hash_path_with_case_hack};
+    pub use crate::encoder::{encode_path_with_case_hack, hash_path_with_case_hack};
     pub use crate::refscan::{
         ReferencePattern, ReferencePatternError, ReferenceScan, ReferenceScanner, ReferenceWriter,
         REFERENCE_LENGTH,
@@ -98,6 +101,14 @@ pub mod nar {
         },
         #[error("file changed size while encoding: {0}")]
         FileChanged(std::path::PathBuf),
+        #[error("invalid incremental encoder event: {0}")]
+        InvalidEncoderEvent(&'static str),
+        #[error("incremental encoder has an unfinished archive")]
+        UnfinishedArchive,
+        #[error("regular file declared {expected} bytes but received {actual}")]
+        RegularSizeMismatch { expected: u64, actual: u64 },
+        #[error("incremental encoder is poisoned after a writer failure")]
+        EncoderPoisoned,
         #[error("unsupported file type: {0}")]
         UnsupportedFileType(std::path::PathBuf),
         #[error(transparent)]

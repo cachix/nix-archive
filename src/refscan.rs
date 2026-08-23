@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::enc::{encode_path, encode_tree, CaseHack, HashSink, Node};
+use crate::encoder::{encode_path, encode_tree, CaseHack, HashSink, Node};
 use crate::nar::Error as NarError;
 
 /// Length of the Nix-base32 hash part at the start of a store-path name.

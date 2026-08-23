@@ -8,7 +8,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::nar::Error;
-use crate::wire::{describe_bytes, Cursor, ReaderCursor, MAGIC, MAX_DEPTH, MAX_METADATA_TOKEN};
+use crate::wire::{
+    describe_bytes, validate_child_name, Cursor, ReaderCursor, MAGIC, MAX_DEPTH, MAX_METADATA_TOKEN,
+};
 
 /// A root-first decoding event.
 ///
@@ -475,32 +477,6 @@ fn parse_reader_node<R: Read + ?Sized>(
                 got: describe_bytes(other),
             })
         }
-    }
-    Ok(())
-}
-
-/// Check a directory entry's name, and its position relative to the entry
-/// before it.
-///
-/// Nix writes entries in strictly ascending byte order; accepting anything
-/// else would let two archives with the same digest decode to different trees.
-/// `previous` is `None` for the first entry in a directory. Both decoders go
-/// through here so the rule cannot drift between them.
-fn validate_child_name(name: &[u8], previous: Option<&[u8]>) -> Result<(), Error> {
-    validate_name(name)?;
-    match previous {
-        Some(previous) if name <= previous => Err(Error::UnsortedEntries(
-            describe_bytes(name),
-            describe_bytes(previous),
-        )),
-        _ => Ok(()),
-    }
-}
-
-pub(crate) fn validate_name(name: &[u8]) -> Result<(), Error> {
-    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
-    {
-        return Err(Error::InvalidName(describe_bytes(name)));
     }
     Ok(())
 }

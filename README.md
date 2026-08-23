@@ -204,6 +204,31 @@ fn main() -> Result<(), Error> {
 `encode_tree` itself does not allocate when the writer does not allocate.
 `hash_tree` computes the NAR size and SHA-256 digest directly.
 
+For asynchronously loaded or external-backed trees, `Encoder` exposes the
+same serialization as validated root-first events. Regular-file contents can
+be supplied incrementally and held across an async suspension:
+
+```rust
+use std::io::Write;
+use nix_archive::nar::{Encoder, Error};
+
+fn main() -> Result<(), Error> {
+    let mut encoder = Encoder::new(Vec::new())?;
+    encoder.start_directory(None)?;
+    let mut file = encoder.start_regular(Some(b"hello"), false, 12)?;
+    file.write_all(b"hello world\n")?;
+    file.finish()?;
+    encoder.end_directory()?;
+    let nar = encoder.finish()?;
+    assert!(!nar.is_empty());
+    Ok(())
+}
+```
+
+The event encoder validates root and directory structure, raw-byte name order,
+nesting depth, and declared file sizes. A writer failure permanently poisons
+the encoder so a truncated archive cannot accidentally be completed.
+
 ## Encode or hash a filesystem tree
 
 ```rust,no_run
@@ -321,6 +346,7 @@ The `nix-archive` command exposes the same choice as `--case-hack
 | `decode` | Allocates the result vector and paths; payloads and symlink targets remain borrowed |
 | `decode_events_reader` | Payload-independent; allocates depth-bounded name buffers and one reused symlink-target buffer |
 | `encode_tree` | Zero allocations with an allocation-free writer |
+| `Encoder` | Payload-independent; retains the previous child name at each open directory depth |
 | `hash_tree` | Zero allocations |
 | `encode_path` / `hash_path` | Allocates directory metadata; streams file payloads |
 | `ReferencePattern` | Allocates candidate lookup state once; clones share it |
@@ -356,7 +382,9 @@ The test suite includes:
 - an Antithesis SDK workload comparing randomized payloads, candidate sets, and chunking against an independent naive oracle;
 - empty patterns, invalid alphabets, writer failures, case-hack modes, and 32 MiB bounded-memory scanning;
 - macOS case-hack round trips and both collision failure modes;
-- exact zero-allocation assertions for borrowed decoding, encoding, hashing, and scanning.
+- exact zero-allocation assertions for borrowed decoding, encoding, hashing, and scanning;
+- incremental encoding parity, event validation, exact payload sizes, writer
+  poisoning, and `Send` across an async suspension.
 
 Run tests with:
 
