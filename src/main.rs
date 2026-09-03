@@ -120,7 +120,7 @@ fn unpack(narfile: &Path, directory: &Path, case_hack: CaseHack) -> Result<(), S
     #[cfg(not(unix))]
     {
         let _ = (narfile, directory, case_hack);
-        return Err("unpacking NAR files is currently supported only on Unix".into());
+        Err("unpacking NAR files is currently supported only on Unix".into())
     }
 
     #[cfg(unix)]
