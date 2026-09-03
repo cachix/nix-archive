@@ -4,13 +4,18 @@
 //! [`encode_path`] streams file contents, but filesystem traversal necessarily
 //! allocates directory names so they can be sorted canonically.
 
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 
@@ -563,10 +568,12 @@ pub fn hash_tree(tree: &Node<'_>) -> Result<NarHash, Error> {
 
 /// Serialize the filesystem tree at `path` as a NAR into `w`.
 ///
-/// Matches Nix's native behavior: directory entries in ascending byte order,
-/// owner-execute determines executability. File payloads are streamed rather
-/// than buffered. Once the root is opened, traversal is descriptor-relative
-/// and does not follow symlinks swapped into the tree concurrently.
+/// Matches Nix's native behavior: directory entries are in ascending byte
+/// order and file payloads are streamed rather than buffered. On Unix,
+/// owner-execute determines executability and descriptor-relative traversal
+/// prevents symlinks swapped into the tree from being followed. On Windows,
+/// filesystem names and symlink targets must be UTF-8 and regular files are
+/// encoded as non-executable.
 ///
 /// `case_hack` is required rather than defaulted because it changes the bytes
 /// written, and therefore the hash. Pass [`CaseHack::native`] to reproduce
@@ -697,15 +704,26 @@ fn encode_tree_node<'tree, W: Write>(
 
 struct DirectoryName {
     disk: OsString,
+    #[cfg(unix)]
     archive_len: usize,
+    #[cfg(windows)]
+    archive: Vec<u8>,
 }
 
 impl DirectoryName {
     fn archive_bytes(&self) -> &[u8] {
-        &self.disk.as_bytes()[..self.archive_len]
+        #[cfg(unix)]
+        {
+            &self.disk.as_bytes()[..self.archive_len]
+        }
+        #[cfg(windows)]
+        {
+            &self.archive
+        }
     }
 }
 
+#[cfg(unix)]
 fn encode_fs_root<W: Write>(
     encoder: &mut EncoderCore<W, OwnedNames>,
     path: &Path,
@@ -726,6 +744,7 @@ fn encode_fs_root<W: Write>(
     encode_opened_node(encoder, None, file, &mut diagnostic_path, case_hack)
 }
 
+#[cfg(unix)]
 fn encode_fs_child<W: Write>(
     encoder: &mut EncoderCore<W, OwnedNames>,
     parent: &fs::File,
@@ -754,6 +773,7 @@ fn encode_fs_child<W: Write>(
     }
 }
 
+#[cfg(unix)]
 fn encode_opened_node<W: Write>(
     encoder: &mut EncoderCore<W, OwnedNames>,
     name: Option<&[u8]>,
@@ -813,6 +833,7 @@ fn encode_opened_node<W: Write>(
     }
 }
 
+#[cfg(unix)]
 fn open_flags(directory: bool) -> OFlags {
     let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     if directory {
@@ -821,18 +842,21 @@ fn open_flags(directory: bool) -> OFlags {
     flags
 }
 
+#[cfg(unix)]
 fn open_path_node(path: &Path, directory: bool) -> io::Result<fs::File> {
     rustix::fs::open(path, open_flags(directory), Mode::empty())
         .map(fs::File::from)
         .map_err(io::Error::from)
 }
 
+#[cfg(unix)]
 fn open_child_node(parent: &fs::File, name: &OsStr, directory: bool) -> io::Result<fs::File> {
     rustix::fs::openat(parent, name, open_flags(directory), Mode::empty())
         .map(fs::File::from)
         .map_err(io::Error::from)
 }
 
+#[cfg(unix)]
 fn read_directory_names(
     directory: &fs::File,
     case_hack: CaseHack,
@@ -857,6 +881,106 @@ fn read_directory_names(
     Ok(names)
 }
 
+#[cfg(windows)]
+fn encode_fs_root<W: Write>(
+    encoder: &mut EncoderCore<W, OwnedNames>,
+    path: &Path,
+    case_hack: CaseHack,
+) -> Result<(), Error> {
+    let mut diagnostic_path = path.to_owned();
+    encode_windows_node(encoder, None, &mut diagnostic_path, case_hack)
+}
+
+#[cfg(windows)]
+fn encode_windows_node<W: Write>(
+    encoder: &mut EncoderCore<W, OwnedNames>,
+    name: Option<&[u8]>,
+    path: &mut PathBuf,
+    case_hack: CaseHack,
+) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(&*path)?;
+
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(&*path)?;
+        let target = windows_path_bytes(&target)?;
+        return encoder.symlink(name, &target);
+    }
+
+    if metadata.is_file() {
+        let mut file = fs::File::open(&*path)?;
+        let len = metadata.len();
+        let mut contents = start_regular_writer(encoder, name, false, len)?;
+        let copied = io::copy(&mut (&mut file).take(len), &mut contents)?;
+        let mut trailing = [0u8; 1];
+        if copied != len || file.take(1).read(&mut trailing)? != 0 {
+            return Err(Error::FileChanged(path.clone()));
+        }
+        return contents.finish();
+    }
+
+    if !metadata.is_dir() {
+        return Err(Error::UnsupportedFileType(path.clone()));
+    }
+
+    encoder.start_directory(name)?;
+    let mut names = read_windows_directory_names(path, case_hack)?;
+    names.sort_unstable_by(|a, b| a.archive_bytes().cmp(b.archive_bytes()));
+    for pair in names.windows(2) {
+        if pair[0].archive_bytes() == pair[1].archive_bytes() {
+            return Err(Error::CaseHackEncodeCollision(
+                path.join(&pair[0].disk),
+                path.join(&pair[1].disk),
+            ));
+        }
+    }
+
+    for child in names {
+        path.push(&child.disk);
+        let result = encode_windows_node(encoder, Some(child.archive_bytes()), path, case_hack);
+        path.pop();
+        result?;
+    }
+    encoder.end_directory()
+}
+
+#[cfg(windows)]
+fn read_windows_directory_names(
+    directory: &Path,
+    case_hack: CaseHack,
+) -> io::Result<Vec<DirectoryName>> {
+    fs::read_dir(directory)?
+        .map(|entry| {
+            let disk = entry?.file_name();
+            let text = disk.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows NAR paths must be valid UTF-8",
+                )
+            })?;
+            let bytes = text.as_bytes();
+            let archive_len = if case_hack.is_enabled() {
+                find_subslice(bytes, CASE_HACK_SUFFIX).unwrap_or(bytes.len())
+            } else {
+                bytes.len()
+            };
+            let archive = bytes[..archive_len].to_vec();
+            Ok(DirectoryName { disk, archive })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    path.to_str()
+        .map(|path| path.as_bytes().to_vec())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows NAR symlink targets must be valid UTF-8",
+            )
+        })
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -872,16 +996,20 @@ mod tests {
     /// contents written to disk (which dump_parity holds against nix-store).
     #[test]
     fn encode_regular_matches_encode_path() {
-        for (contents, executable) in [
+        #[cfg(not(unix))]
+        let cases = [(&b"hello\n"[..], false), (&b""[..], false)];
+        #[cfg(unix)]
+        let cases = [
             (&b"hello\n"[..], false),
             (&b"#!/bin/sh\n"[..], true),
             (&b""[..], false),
-        ] {
+        ];
+        for (contents, executable) in cases {
             let tmp = tempfile::tempdir().unwrap();
             let file = tmp.path().join("f");
             std::fs::write(&file, contents).unwrap();
+            #[cfg(unix)]
             if executable {
-                use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let mut from_fs = Vec::new();
@@ -896,6 +1024,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn opened_nodes_cannot_be_redirected_by_path_swaps() {
         let tmp = tempfile::tempdir().unwrap();

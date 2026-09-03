@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Support filesystem encoding and collected NAR decoding on Windows. Windows
+  filesystem names and symlink targets must be UTF-8, and regular files are
+  encoded as non-executable to match Nix's Windows behavior.
+
+### Changed
+
+- Make Unix-only filesystem restoration APIs conditional, so portable wire,
+  encoding, hashing, and reference-scanning consumers compile on Windows.
+
 ## [0.4.0] - 2026-08-23
 
 ### Added

@@ -4,11 +4,10 @@ Byte-safe encoding, decoding, hashing, and restoration for Nix archive
 formats, without linking to Nix.
 
 The crate currently implements the Nix Archive format under
-`nix_archive::nar`. NAR names, symlink targets, and file contents are raw
-bytes: they are never required to be UTF-8.
-
-`nix-archive` is Unix-only because lossless filesystem paths and executable
-mode handling use Unix APIs.
+`nix_archive::nar`. Its wire APIs preserve NAR names, symlink targets, and file
+contents as raw bytes. Filesystem encoding works on Unix and Windows; Windows
+paths and symlink targets must be UTF-8, and regular files are non-executable,
+matching Nix's Windows stat behavior. Filesystem restoration is Unix-only.
 
 ## Highlights
 
@@ -18,7 +17,7 @@ mode handling use Unix APIs.
 - Allocation-free borrowed-tree encoding and SHA-256 hashing.
 - Streaming filesystem encoding: file payloads are never materialized.
 - Streaming Nix-compatible reference scanning with reusable candidate sets.
-- Descriptor-relative filesystem traversal and restoration resist symlink swaps.
+- Descriptor-relative Unix filesystem traversal and restoration resist symlink swaps.
 - Post-order collecting decoder for content-addressed tree ingestion.
 - Nix-compatible macOS case-collision restoration and re-encoding.
 - Non-UTF-8 filenames and symlink targets preserved exactly.

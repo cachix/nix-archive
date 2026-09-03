@@ -1,9 +1,10 @@
 //! NAR decoding, either as allocation-free borrowed events or as a collected
 //! post-order entry stream.
 
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -214,7 +215,7 @@ pub fn decode(nar: &[u8]) -> Result<Vec<Entry<'_>>, Error> {
         match event {
             Event::DirectoryStart { name } => {
                 if let Some(name) = name {
-                    directory.push(OsStr::from_bytes(name));
+                    directory.push(os_string_from_bytes(name)?);
                 }
             }
             Event::DirectoryEnd { name } => {
@@ -230,12 +231,12 @@ pub fn decode(nar: &[u8]) -> Result<Vec<Entry<'_>>, Error> {
                 executable,
                 contents,
             } => entries.push(Entry::Regular {
-                path: path_for_name(&directory, name),
+                path: path_for_name(&directory, name)?,
                 executable,
                 contents,
             }),
             Event::Symlink { name, target } => entries.push(Entry::Symlink {
-                path: path_for_name(&directory, name),
+                path: path_for_name(&directory, name)?,
                 target,
             }),
         }
@@ -245,11 +246,29 @@ pub fn decode(nar: &[u8]) -> Result<Vec<Entry<'_>>, Error> {
     Ok(entries)
 }
 
-fn path_for_name(directory: &std::path::Path, name: Option<&[u8]>) -> PathBuf {
+fn path_for_name(directory: &std::path::Path, name: Option<&[u8]>) -> Result<PathBuf, Error> {
     match name {
-        Some(name) => directory.join(OsStr::from_bytes(name)),
-        None => directory.to_owned(),
+        Some(name) => Ok(directory.join(os_string_from_bytes(name)?)),
+        None => Ok(directory.to_owned()),
     }
+}
+
+#[cfg(unix)]
+fn os_string_from_bytes(bytes: &[u8]) -> Result<OsString, Error> {
+    Ok(std::ffi::OsStr::from_bytes(bytes).to_owned())
+}
+
+#[cfg(windows)]
+fn os_string_from_bytes(bytes: &[u8]) -> Result<OsString, Error> {
+    use std::path::Component;
+
+    let name = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidName(crate::wire::describe_bytes(bytes)))?;
+    let mut components = std::path::Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(Error::InvalidName(crate::wire::describe_bytes(bytes)));
+    }
+    Ok(OsString::from(name))
 }
 
 fn parse_node<'a>(

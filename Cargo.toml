@@ -16,10 +16,12 @@ cli = ["dep:clap"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
-libc = "0.2"
-rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 antithesis_sdk = "0.2.9"

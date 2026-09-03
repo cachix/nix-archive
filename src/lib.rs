@@ -3,6 +3,7 @@
 mod dec;
 mod encoder;
 mod refscan;
+#[cfg(unix)]
 mod restore;
 mod wire;
 
@@ -37,7 +38,8 @@ mod wire;
 ///   [`CaseHack::native`](crate::nar::CaseHack::native) reproduces Nix's own
 ///   default.
 ///
-/// Names, symlink targets, and contents are raw bytes; none require UTF-8.
+/// The wire-level APIs preserve names, symlink targets, and contents as raw
+/// bytes. Filesystem paths require UTF-8 when collected or encoded on Windows.
 pub mod nar {
     pub use crate::dec::{
         decode, decode_events, decode_events_reader, Entry, Event, FileContents, ReadEvent,
@@ -52,7 +54,9 @@ pub mod nar {
         ReferencePattern, ReferencePatternError, ReferenceScan, ReferenceScanner, ReferenceWriter,
         REFERENCE_LENGTH,
     };
+    #[cfg(unix)]
     pub use crate::restore::{restore, restore_reader};
+    #[cfg(unix)]
     #[allow(deprecated)]
     pub use crate::restore::{
         restore_path, restore_path_with_case_hack, restore_reader_with_case_hack,

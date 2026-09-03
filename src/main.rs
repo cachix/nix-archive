@@ -1,10 +1,14 @@
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
+#[cfg(unix)]
+use std::io::BufReader;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use nix_archive::nar::{encode_path, restore_reader, CaseHack};
+#[cfg(unix)]
+use nix_archive::nar::restore_reader;
+use nix_archive::nar::{encode_path, CaseHack};
 
 /// Pack and unpack Nix Archive (NAR) files without linking to Nix.
 #[derive(Parser)]
@@ -113,27 +117,37 @@ fn pack(narfile: &Path, directory: &Path, case_hack: CaseHack) -> Result<(), Str
 }
 
 fn unpack(narfile: &Path, directory: &Path, case_hack: CaseHack) -> Result<(), String> {
-    // Each branch calls `restore_reader` on its own concrete reader rather than
-    // through one `&mut dyn Read`: the erased form costs a userspace round trip
-    // per chunk, where the concrete one lets the payload copy stay in the
-    // kernel.
-    let restored = if narfile == Path::new("-") {
-        restore_reader(&mut io::stdin().lock(), directory, case_hack)
-    } else {
-        let archive = File::open(narfile)
-            .map_err(|error| format!("cannot open {}: {error}", narfile.display()))?;
-        restore_reader(&mut BufReader::new(archive), directory, case_hack)
-    };
+    #[cfg(not(unix))]
+    {
+        let _ = (narfile, directory, case_hack);
+        return Err("unpacking NAR files is currently supported only on Unix".into());
+    }
 
-    restored.map_err(|error| {
-        format!(
-            "cannot unpack {} into {}: {error}",
-            archive_name(narfile),
-            directory.display()
-        )
-    })
+    #[cfg(unix)]
+    {
+        // Each branch calls `restore_reader` on its own concrete reader rather than
+        // through one `&mut dyn Read`: the erased form costs a userspace round trip
+        // per chunk, where the concrete one lets the payload copy stay in the
+        // kernel.
+        let restored = if narfile == Path::new("-") {
+            restore_reader(&mut io::stdin().lock(), directory, case_hack)
+        } else {
+            let archive = File::open(narfile)
+                .map_err(|error| format!("cannot open {}: {error}", narfile.display()))?;
+            restore_reader(&mut BufReader::new(archive), directory, case_hack)
+        };
+
+        restored.map_err(|error| {
+            format!(
+                "cannot unpack {} into {}: {error}",
+                archive_name(narfile),
+                directory.display()
+            )
+        })
+    }
 }
 
+#[cfg(unix)]
 fn archive_name(path: &Path) -> String {
     if path == Path::new("-") {
         "standard input".into()
