@@ -31,7 +31,9 @@ fn golden(hex: &str) -> Vec<u8> {
     let digits: Vec<_> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     assert_eq!(digits.len() % 2, 0, "golden hex has an odd length");
     digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = (pair[0] as char).to_digit(16).expect("golden is hex");
             let low = (pair[1] as char).to_digit(16).expect("golden is hex");
