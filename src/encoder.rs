@@ -990,6 +990,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::nar::{decode, Entry};
 
     /// encode_regular must agree byte for byte with encode_path over the same

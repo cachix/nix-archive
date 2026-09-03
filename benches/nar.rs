@@ -1,5 +1,7 @@
 //! Run with `cargo bench -p nix-archive --bench nar`.
 
+#![cfg(unix)]
+
 #[path = "support/nix_daemon.rs"]
 mod nix_daemon;
 
