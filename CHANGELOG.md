@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-04
+
 ### Added
 
 - Support filesystem encoding and collected NAR decoding on Windows. Windows
@@ -91,7 +93,8 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/cachix/nix-archive/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cachix/nix-archive/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cachix/nix-archive/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cachix/nix-archive/releases/tag/v0.4.0
 [0.3.0]: https://github.com/cachix/nix-archive/releases/tag/v0.3.0
 [0.2.0]: https://github.com/cachix/nix-archive/releases/tag/v0.2.0
